@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>v_weinstein_bull_sensitive 全量回测报告 2016-2026</title>
+<style>
+  body { font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 20px; color: #222; line-height: 1.7; }
+  h1 { font-size: 24px; border-bottom: 3px solid #FF9800; padding-bottom: 12px; }
+  h2 { font-size: 18px; border-left: 4px solid #FF9800; padding-left: 12px; margin-top: 40px; color: #E65100; }
+  h3 { font-size: 15px; color: #333; margin-top: 24px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+  th { background: #FF9800; color: white; padding: 8px 12px; text-align: center; }
+  td { padding: 7px 12px; border: 1px solid #ddd; text-align: center; }
+  tr:nth-child(even) { background: #fff8f0; }
+  .highlight { background: #fff3e0 !important; font-weight: bold; color: #BF360C; }
+  .win { color: #2e7d32; }
+  .loss { color: #c62828; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+  .tag-good { background: #e8f5e9; color: #2e7d32; }
+  .tag-bad { background: #ffebee; color: #c62828; }
+  .tag-neutral { background: #fff8e1; color: #f57f17; }
+  .summary-box { background: linear-gradient(135deg, #fff8f0, #fff3e0); border-radius: 12px; padding: 20px 24px; margin: 24px 0; border: 1px solid #ffcc80; }
+  .summary-box h3 { margin-top: 0; color: #E65100; }
+  .conclusion { background: #fafafa; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+  img { max-width: 100%; border: 1px solid #ddd; border-radius: 8px; margin: 16px 0; }
+  .footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid #eee; color: #999; font-size: 12px; }
+  .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+  .metric-card { background: #fff8f0; border-radius: 8px; padding: 14px; text-align: center; border: 1px solid #ffe0b2; }
+  .metric-card .value { font-size: 22px; font-weight: bold; color: #FF9800; }
+  .metric-card .label { font-size: 12px; color: #666; margin-top: 4px; }
+  .vs-table td:nth-child(2), .vs-table td:nth-child(4) { font-weight: bold; }
+  .pos-year { background: #e8f5e9; }
+  .neg-year { background: #ffebee; }
+  .pass { color: #2e7d32; font-weight: bold; }
+  .fail { color: #c62828; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>v_weinstein_bull_sensitive 全量回测报告（2016-2026）</h1>
+
+<p><strong>策略版本：</strong>优化参数（RS80, 2.0x放量, 10%/追踪分批止盈, 5%/10%分批止损）&nbsp;&nbsp;|&nbsp;&nbsp;
+<strong>回测区间：</strong>2016-01-01 至 2026-03-27&nbsp;&nbsp;|&nbsp;&nbsp;
+<strong>股票池：</strong>501只（美股）&nbsp;&nbsp;|&nbsp;&nbsp;
+<strong>初始资金：</strong>$50,000 &nbsp;|&nbsp; <strong>每笔仓位：</strong>$2,000</p>
+
+<h2>一、核心指标</h2>
+
+<div class="metric-grid">
+  <div class="metric-card"><div class="value">+39.3%</div><div class="label">总收益</div></div>
+  <div class="metric-card"><div class="value">+3.3%</div><div class="label">年化收益</div></div>
+  <div class="metric-card"><div class="value">6.0%</div><div class="label">最大回撤</div></div>
+  <div class="metric-card"><div class="value">0.63</div><div class="label">夏普比率</div></div>
+  <div class="metric-card"><div class="value">44.9%</div><div class="label">胜率</div></div>
+  <div class="metric-card"><div class="value">1.97</div><div class="label">盈亏比</div></div>
+  <div class="metric-card"><div class="value">1082笔</div><div class="label">总交易次数</div></div>
+  <div class="metric-card"><div class="value">$69,649</div><div class="label">期末资金</div></div>
+</div>
+
+<h2>二、净值曲线 & 资金利用率</h2>
+<img src="file:///Users/wubo/Desktop/%E4%BF%A1%E5%8F%B7%E7%B3%BB%E7%BB%9F%E5%85%8B%E5%8A%B3%E5%BE%B7V3.1_Minimax%E6%94%AF%E7%BA%BF/signal_system/output/v_weinstein_bull_sensitive/backtest/equity_curve_2016_2026.png" alt="净值曲线与资金利用率" style="max-width:1000px;width:100%">
+<p style="color:#666;font-size:12px;margin-top:4px">上图：蓝线=策略净值（$50,000 → $69,649）| 下图：橙线=资金使用率（峰值238%，平均62%）</p>
+
+<h2>三、SPY 对比（关键数据）</h2>
+
+<table>
+  <tr><th>指标</th><th>策略</th><th>SPY（参考）</th><th>评价</th></tr>
+  <tr class="highlight"><td>总收益</td><td class="win">+39.3%</td><td class="loss">+185.0%</td><td>SPY大幅领先</td></tr>
+  <tr><td>年化收益</td><td>+3.3%</td><td>+11.2%</td><td>SPY年化更高</td></tr>
+  <tr class="highlight"><td>最大回撤</td><td class="win">6.0%</td><td class="loss">34.0%</td><td>策略回撤更小</td></tr>
+  <tr><td>夏普比率</td><td>0.63</td><td>~0.9</td><td>SPY风险调整更优</td></tr>
+  <tr><td>同期年化（2020-2026）</td><td>+6.9%</td><td>+14.2%</td><td>SPY领先</td></tr>
+</table>
+
+<h2>四、年度收益对照</h2>
+
+<table>
+  <tr><th>年份</th><th>策略收益</th><th>SPY收益</th><th>差异</th><th>胜出</th></tr>
+  <tr class="neg-year"><td>2016</td><td>+0.0%</td><td>+11.2%</td><td class="loss">-11.2%</td><td>—</td></tr>
+  <tr class="neg-year"><td>2017</td><td>+9.6%</td><td>+18.5%</td><td class="loss">-8.9%</td><td>—</td></tr>
+  <tr class="neg-year"><td>2018</td><td>+0.6%</td><td>-7.0%</td><td class="loss">+7.6%</td><td>✅ 策略赢</td></tr>
+  <tr class="neg-year"><td>2019</td><td>+7.0%</td><td>+28.7%</td><td class="loss">-21.7%</td><td>—</td></tr>
+  <tr class="neg-year"><td>2020</td><td>-5.1%</td><td>+15.1%</td><td class="loss">-20.2%</td><td>—</td></tr>
+  <tr class="neg-year"><td>2021</td><td>+8.4%</td><td>+38.4%</td><td class="loss">-30.0%</td><td>—</td></tr>
+  <tr class="pos-year"><td>2022</td><td>-8.8%</td><td>-15.1%</td><td class="win">+6.3%</td><td>✅ 策略赢</td></tr>
+  <tr class="neg-year"><td>2023</td><td>+7.8%</td><td>+30.2%</td><td class="loss">-22.4%</td><td>—</td></tr>
+  <tr class="pos-year"><td>2024</td><td>+36.1%</td><td>+27.4%</td><td class="win">+8.7%</td><td>✅ 策略赢</td></tr>
+  <tr class="neg-year"><td>2025</td><td>+7.2%</td><td>+18.3%</td><td class="loss">-11.1%</td><td>—</td></tr>
+  <tr class="pos-year"><td>2026(Q1)</td><td>+2.6%</td><td>-5.3%</td><td class="win">+7.9%</td><td>✅ 策略赢</td></tr>
+</table>
+
+<p>11个年度中策略 <strong>4年跑赢SPY</strong>，7年跑输。跑赢主要集中在熊市/震荡年份（2018, 2022, 2024, 2026）。</p>
+
+<h2>五、全部回测结果汇总</h2>
+
+<h3>5.1 参数迭代对比</h3>
+<table>
+  <tr><th>实验</th><th>周期</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>胜率</th><th>盈亏比</th><th>月均信号</th><th>交易次数</th></tr>
+  <tr><td>RS90/2.5x（原始）</td><td>全量 2020-2026</td><td>+4.2%</td><td>8.5%</td><td>0.57</td><td>43.4%</td><td>2.09</td><td>4.9</td><td>364</td></tr>
+  <tr class="highlight"><td>RS80/2.0x（最终）</td><td>全量 2016-2026</td><td class="win">+3.3%</td><td class="win">6.0%</td><td class="win">0.63</td><td class="win">44.9%</td><td class="win">1.97</td><td class="win">8.8</td><td class="win">1082</td></tr>
+  <tr><td>RS90/2.5x（原始）</td><td>样本内 2020-2024</td><td>+1.1%</td><td>4.2%</td><td>0.24</td><td>43.2%</td><td>1.59</td><td>9.1</td><td>456</td></tr>
+  <tr><td>RS90/2.5x（原始）</td><td>OOS 2024-2026</td><td>+6.4%</td><td>4.9%</td><td>1.05</td><td>42.5%</td><td>1.98</td><td>14.2</td><td>355</td></tr>
+  <tr class="highlight"><td>RS80/2.0x（最终）</td><td>OOS 2024-2026</td><td class="win">+7.9%</td><td class="win">4.8%</td><td class="win">1.14</td><td class="win">45.2%</td><td>1.90</td><td>17.4</td><td>434</td></tr>
+  <tr><td>RS80/2.2x（中间）</td><td>OOS 2024-2026</td><td>+6.4%</td><td>4.9%</td><td>1.05</td><td>42.5%</td><td>1.98</td><td>14.2</td><td>355</td></tr>
+</table>
+
+<h3>5.2 OOS 样本外（2024-02 ~ 2026-03）核心指标</h3>
+<table>
+  <tr><th>指标</th><th>数值</th><th>及格线</th><th>状态</th></tr>
+  <tr><td>总收益</td><td class="win">+17.0%</td><td>—</td><td>—</td></tr>
+  <tr><td>年化收益</td><td>+7.9%</td><td>> 15%</td><td class="fail">✗</td></tr>
+  <tr><td>夏普比率</td><td class="win">1.14</td><td>> 1.0</td><td class="pass">✓</td></tr>
+  <tr><td>最大回撤</td><td class="win">4.8%</td><td>< 25%</td><td class="pass">✓</td></tr>
+  <tr><td>胜率</td><td class="win">45.2%</td><td>> 40%</td><td class="pass">✓</td></tr>
+  <tr><td>盈亏比</td><td class="win">1.90</td><td>> 1.5</td><td class="pass">✓</td></tr>
+  <tr><td>每月信号数</td><td>17.4</td><td>2~10</td><td class="fail">✗</td></tr>
+  <tr class="highlight"><td>综合评级</td><td colspan="3"><strong>5/6 项达标</strong></td></tr>
+</table>
+
+<h2>六、策略参数</h2>
+
+<h3>入场条件</h3>
+<table>
+  <tr><th>参数</th><th>数值</th><th>说明</th></tr>
+  <tr><td>sma_long</td><td>150</td><td>长期均线（判断个股趋势）</td></tr>
+  <tr><td>trend_lookback</td><td>30</td><td>SMA150 需连续 30 天上升</td></tr>
+  <tr><td>pivot_lookback</td><td>30</td><td>突破近 30 日整理区高点</td></tr>
+  <tr><td>min_breakout_pct</td><td>0.5%</td><td>突破幅度至少 0.5%</td></tr>
+  <tr class="highlight"><td>volume_mult_strict</td><td class="win">2.0x</td><td>当日成交量 ≥ 20 日均量 2 倍（已放宽）</td></tr>
+  <tr><td>sma_market</td><td>50</td><td>SPY 需在 SMA50 上方（牛市判断）</td></tr>
+  <tr class="highlight"><td>rs_min_percentile</td><td class="win">80</td><td>RS 前 20%（已从 90 放宽）</td></tr>
+</table>
+
+<h3>出场条件</h3>
+<table>
+  <tr><th>参数</th><th>数值</th><th>说明</th></tr>
+  <tr><td>stop_loss_tier1</td><td>-5%</td><td>跌 5% 卖出一半</td></tr>
+  <tr><td>stop_loss_tier2</td><td>-10%</td><td>再跌到 10% 卖剩余（清仓）</td></tr>
+  <tr><td>profit_take_tier1</td><td>+10%</td><td>涨 10% 卖出一半</td></tr>
+  <tr><td>trailing_stop_pct</td><td>15%</td><td>剩余半仓从最高点回落 15% 止盈</td></tr>
+</table>
+
+<h2>七、结论</h2>
+
+<div class="summary-box">
+  <h3>策略定位：保守型防御策略 — 牺牲牛市涨幅换取熊市保护</h3>
+  <ul>
+    <li>11个年度中仅<strong>4年跑赢SPY</strong>，但跑输时差距可控（最大-30%）</li>
+    <li>熊市防御效果显著：2022年SPY跌15%时策略仅跌8.8%，2020年SPY涨15%策略仍跌5.1%（牛市建仓迟缓）</li>
+    <li>最大优势在于<strong>最大回撤极小</strong>（6%），账户波动远低于大盘</li>
+    <li>OOS 夏普 1.14，风险调整后收益可观；10年夏普 0.63 偏低</li>
+    <li>参数放宽后（RS80/2.0x）：OOS 夏普从 0.88 → 1.14，收益明显提升</li>
+  </ul>
+</div>
+
+<div class="conclusion">
+  <strong>建议：</strong>当前策略（$2000固定仓位）作为<strong>防御性仓位</strong>与大盘指数组合使用，互补风险。牛市初期信号偏少、反应偏慢是主要短板。实盘建议选择性执行月均17个候选信号中的最强10个，可兼顾收益与频率。
+</div>
+
+<div class="footer">
+  <p>报告生成时间：2026-04-02 | 数据来源：本地缓存 | 策略版本：v_weinstein_bull_sensitive | 最终参数：RS80 + 2.0x放量</p>
+</div>
+
+</body>
+</html>

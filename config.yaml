@@ -1,0 +1,165 @@
+# ============================================================
+# config.yaml — v_eps_v2 专属环境（精简版）
+# ============================================================
+
+# ------------------------------------------------------------
+# 股票池
+# ------------------------------------------------------------
+# 手动股票池：见 UNIVERSE.md（唯一来源，代码直接读取该文件）
+# 在 UNIVERSE.md 中增删股票，下次运行自动生效，无需改此处。
+
+# 自动股票池：Alpaca 新闻 API，每次运行增量更新
+auto_universe:
+  source: alpaca
+  initial_lookback_days: 365
+  max_age_days: 365
+  include_indices:
+    - sp500
+    - nasdaq100
+    - russell2000
+
+# 合并规则：最终股票池 = UNIVERSE.md ∪ 指数成分股 ∪ Alpaca 自动池（自动去重）
+
+# ------------------------------------------------------------
+# 数据获取
+# ------------------------------------------------------------
+data:
+  timeframe: "1d"
+  history_days: 3652       # 约10年，覆盖多个完整牛熊周期
+
+# ── 默认策略 ──────────────────────────────────────────────
+active_strategy: v_eps_v2
+
+# ── 策略参数 ──────────────────────────────────────────────
+strategies:
+  # Weinstein Stage 2 基础策略（v_eps_v2 继承此类）
+  v_weinstein:
+    name: Weinstein Stage 2 分析
+    description: "SMA150 上升 + 价格突破整理区，无 VCP，无 RS，长周期策略"
+
+    sma_long: 150
+    trend_lookback: 30
+    pivot_lookback: 30
+    min_breakout_pct: 0.005
+    volume_mult: 1.5
+
+    stop_loss_pct: 0.10
+    trailing_stop_pct: 0.18
+    time_stop_days: 30
+    time_stop_min_gain: 0.05
+
+  v_eps_v2:
+    name: "Weinstein + EPS (优化版)"
+    description: "Weinstein Stage 2 技术框架 + EPS 增长筛选（冠军参数：OOS夏普1.39，2016-2026年化6.4%）"
+
+    # Weinstein Stage 2 技术参数
+    sma_long: 150
+    trend_lookback: 30
+    pivot_lookback: 30
+    min_breakout_pct: 0.005
+    volume_mult: 1.5
+
+    stop_loss_pct: 0.08
+    trailing_stop_pct: 0.15
+    time_stop_days: 60
+    time_stop_min_gain: 0.05
+
+    # EPS 基本面参数
+    eps_quarters_required: 2
+    eps_yoy_required: true
+    eps_qoq_required: true
+
+  # ================================================================
+  # 捡烟蒂V1A：纯格雷厄姆NCAV深度价值
+  # ================================================================
+  cigar_butt_v1a:
+    name: "捡烟蒂V1A-纯NCAV"
+    description: "巴菲特早期策略：P/NCAV < 0.67，只看清算价值，不考虑盈利质量"
+
+    # ── 入池过滤 ────────────────────────────────────────────────
+    max_p_ncav: 0.67                # P/NCAV 必须 < 0.67
+    min_market_cap: 50_000_000     # 最小市值 $5000万
+    max_market_cap: 50_000_000_000  # 最大市值 $500亿（捡烟蒂不设严格上限）
+    min_avg_volume_20d: 100_000     # 20日均成交 > 10万股
+    max_debt_ratio: 0.80           # 负债/资产 < 80%
+
+    # ── 仓位管理 ────────────────────────────────────────────────
+    min_positions: 15               # 最少持仓数
+    max_positions: 20              # 最多持仓数
+    max_single_position_pct: 0.10   # 单只仓位上限 10%
+
+    # ── 持有期 ──────────────────────────────────────────────────
+    target_hold_months: 18          # 目标持有期（月）
+    force_sell_days: 540           # 最大持有期 18个月≈540天
+
+    # ── 退出规则 ────────────────────────────────────────────────
+    sell_p_ncav_threshold: 1.0     # P/NCAV > 1.0 卖出
+    stop_loss_pct: 0.25            # 跌幅 > 25% 检查
+
+    # ── Rebalance ───────────────────────────────────────────────
+    rebalance_frequency: "monthly"  # 每月rebalance
+
+  # ================================================================
+  # 捡烟蒂V1B：深度价值 + 盈利过滤
+  # ================================================================
+  cigar_butt_v1b:
+    name: "捡烟蒂V1B-深度价值+盈利过滤"
+    description: "在V1A基础上加入盈利质量过滤，避免价值陷阱"
+
+    # ── 第一层：深度价值过滤 ────────────────────────────────────
+    max_p_ncav: 0.75              # P/NCAV < 0.75
+    max_p_netnet: 0.85           # P/Net-Net < 0.85
+    max_p_b: 1.2                 # P/B < 1.2
+    max_p_e: 15                  # P/E < 15
+    max_debt_ratio: 0.50         # 负债/资产 < 50%（比V1A严格）
+
+    # ── 第二层：盈利质量过滤 ────────────────────────────────────
+    require_positive_eps: true     # 近4季度净利润 > 0
+    require_positive_cfo: true     # 经营现金流 > 0
+    max_revenue_decline_1y: 0.20  # 营收下降 < 20%
+
+    # ── 第三层：流动性过滤 ──────────────────────────────────────
+    min_market_cap: 100_000_000   # 最小市值 $1亿
+    max_market_cap: 5_000_000_000 # 最大市值 $50亿
+    min_avg_dollar_volume_20d: 1_000_000  # 日均成交额 > $100万
+
+    # ── 仓位管理 ────────────────────────────────────────────────
+    min_positions: 15              # 最少持仓数
+    max_positions: 25              # 最多持仓数
+    max_single_position_pct: 0.08  # 单只仓位上限 8%
+
+    # ── 持有期 ──────────────────────────────────────────────────
+    target_hold_months: 24        # 目标持有期 24个月
+    time_stop_days: 720            # 时间止损 24个月
+
+    # ── 退出规则 ────────────────────────────────────────────────
+    sell_p_ncav_threshold: 1.0    # P/NCAV > 1.0 卖出
+    sell_pe_threshold: 25          # P/E > 25 重新评估
+    stop_loss_pct: 0.20           # 跌幅 > 20% 检查
+    min_gain_for_time_stop: 0.05   # 时间止损需盈利 < 5%
+
+    # ── 综合评分权重 ─────────────────────────────────────────────
+    score_p_ncav_weight: 0.30    # P/NCAV 权重 30%
+    score_pe_weight: 0.20         # P/E 权重 20%
+    score_debt_weight: 0.20       # 负债率 权重 20%
+    score_cfo_weight: 0.15        # 经营现金流/股价 权重 15%
+    score_size_weight: 0.15       # 市值 权重 15%
+
+    # ── Rebalance ───────────────────────────────────────────────
+    rebalance_frequency: "monthly"  # 每月rebalance
+
+# ------------------------------------------------------------
+# 输出设置
+# ------------------------------------------------------------
+output:
+  print_to_console: true
+  save_to_csv: true
+
+# ------------------------------------------------------------
+# 股票池扫描（--mode scan）
+# ------------------------------------------------------------
+scan:
+  sa_quant_min: 4.5
+  min_market_cap_b: 1.0
+  max_new_per_run: 30
+  request_delay_seconds: 1.2
