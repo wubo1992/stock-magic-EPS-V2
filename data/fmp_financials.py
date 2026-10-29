@@ -8,7 +8,7 @@ FMP API 提供完整的财务报表数据：
 
 免费层限制：每天 250 次请求，足够回测使用
 
-API Key: acLxQjyVgy8PE5cZNxsMxQYcXMrCmBoc
+API Key 从 .env 的 FMP_API_KEY 读取（不要把密钥写进代码里）
 """
 
 import os
@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(env_path)
 
-FMP_API_KEY = os.getenv("FMP_API_KEY", "acLxQjyVgy8PE5cZNxsMxQYcXMrCmBoc")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
 CACHE_DIR = Path(__file__).parent / "cache"

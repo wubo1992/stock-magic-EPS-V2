@@ -34,7 +34,7 @@ from data.polygon_financials import get_full_financials
 from strategies.cigar_butt_v1a import CigarButtV1AStrategy
 from strategies.cigar_butt_v1b import CigarButtV1BStrategy
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "tnCPh87aCFFoePifS6310VxRKTBiZUPO")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
 
 def fetch_polygon_prices(symbols: list[str], start_date: datetime, end_date: datetime) -> dict:

@@ -17,12 +17,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from dotenv import load_dotenv
+
+# 加载 .env（密钥只放本地，不进代码库）
+load_dotenv(Path(__file__).parent / ".env")
 
 # 设置路径
 CACHE_DIR = Path("data/cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-POLYGON_KEY = os.getenv("POLYGON_API_KEY", "tnCPh87aCFFoePifS6310VxRKTBiZUPO")
+POLYGON_KEY = os.getenv("POLYGON_API_KEY")
 
 
 def load_russell2000() -> list[str]:

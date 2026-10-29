@@ -1,7 +1,7 @@
 """
 data/polygon_financials.py — Polygon.io / Massive.com 财务数据模块
 
-API Key: tnCPh87aCFFoePifS6310VxRKTBiZUPO
+API Key 从 .env 的 POLYGON_API_KEY 读取（不要把密钥写进代码里）
 
 数据端点：GET https://api.polygon.io/v2/reference/financials/{ticker}
 

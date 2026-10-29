@@ -27,8 +27,8 @@ import requests
 from strategies.cigar_butt_v1a import CigarButtV1AStrategy
 from strategies.cigar_butt_v1b import CigarButtV1BStrategy
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "tnCPh87aCFFoePifS6310VxRKTBiZUPO")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d61a0n1r01qn5qe73o7gd61a0n1r01qn5qe73o80")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
 # V1B额外数据缓存（避免重复API调用）
 _v1b_financials_cache: dict[str, dict] = {}

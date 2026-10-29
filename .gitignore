@@ -16,6 +16,27 @@ data/cache/
 data/universe_cache.json
 data/index_cache.json
 
+# 影子下载目录 / 隔离区 / 刷新暂存（data/cache_* 都是可回滚备份，不上传）
+data/cache_*/
+
+# RS 全市场排名池的生成产物（都能用 tools/ 重建，不上传）
+# data/rs_universe_src/ = Nasdaq screener / SymDir 原始下载
+# data/*.pkl = rs_universe_closes.pkl（60MB 全市场收盘价宽表）
+# data/rs_universe.json = 全市场证券名单（3.5MB，每周重建）
+# data/rs_daily_cache.json = RS 每日缓存
+# data/sector_cache.json = 板块缓存
+# data/rsfix_*.json = 脏数据修复清单
+data/rs_universe_src/
+data/*.pkl
+data/rs_universe.json
+data/rs_daily_cache.json
+data/sector_cache.json
+data/rsfix_*.json
+data/*manifest*.json
+data/download_failed.txt
+data/dot_retry.json
+data/*.bak.*
+
 # ============================
 # 运行时输出（持仓、信号、报告）
 # ============================
@@ -67,3 +88,7 @@ com.sepa.signal.daily.plist
 # ============================
 *.log
 *.tmp
+*.bak.livetest-today
+
+# 第三方工具的本地工作目录
+.workbuddy/
