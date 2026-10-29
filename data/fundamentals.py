@@ -346,11 +346,47 @@ def _check_eps_growth(
                 qoq_growth = False
                 break
 
+    # ── 详细指标（用于信号 reason 展示） ─────────────────────────
+    # 连续环比增长数：从最新季度往前数，直到出现非增长或到达历史末尾
+    consecutive_qoq_growth = 0
+    for i in range(len(eps_history) - 1):
+        if eps_history[i][1] > eps_history[i + 1][1]:
+            consecutive_qoq_growth += 1
+        else:
+            break
+
+    # 连续同比正增长数：最多 3 对（要求有 ≥7 季度数据）
+    consecutive_yoy_growth = 0
+    for i in range(min(3, len(eps_history) - 4)):
+        if eps_history[i][1] > eps_history[i + 4][1]:
+            consecutive_yoy_growth += 1
+        else:
+            break
+
+    # 最新环比增速（用 abs(prev) 防止跨负数时符号错乱）
+    latest_eps_val = eps_values[0]
+    prev_q_eps = eps_values[1] if len(eps_values) >= 2 else None
+    if prev_q_eps is not None and prev_q_eps != 0:
+        qoq_growth_rate = (latest_eps_val - prev_q_eps) / abs(prev_q_eps)
+    else:
+        qoq_growth_rate = None
+
+    # 最新同比增速
+    year_ago_eps = eps_history[4][1] if len(eps_history) > 4 else None
+    if year_ago_eps is not None and year_ago_eps != 0:
+        yoy_growth_rate = (latest_eps_val - year_ago_eps) / abs(year_ago_eps)
+    else:
+        yoy_growth_rate = None
+
     return {
         'has_data': True,
         'quarters': len(eps_history),
         'yoy_growth': yoy_growth,
         'qoq_growth': qoq_growth,
+        'consecutive_qoq_growth': consecutive_qoq_growth,
+        'consecutive_yoy_growth': consecutive_yoy_growth,
+        'qoq_growth_rate': qoq_growth_rate,
+        'yoy_growth_rate': yoy_growth_rate,
         'latest_eps': eps_values[0],
         'eps_history': eps_history,
         'error': None
@@ -378,23 +414,56 @@ def check_eps_filter(
     if not result['has_data']:
         return False, f"EPS数据不足({result['quarters']}季度)"
 
-    passed = True
-    reasons = []
+    latest = result.get('latest_eps') or 0
+    eps_negative = latest < 0
+    eps_str = f"${latest:.2f}" if latest else "N/A"
 
-    if require_yoy and not result['yoy_growth']:
-        passed = False
-        reasons.append("同比未增长")
-    else:
-        reasons.append("同比+")
+    def _growth_phrase(rate, base_word, fail, eps_negative=False):
+        """生成「比去年同期高 X.X%」类短语；rate=None 时只说方向。
 
-    if require_qoq and not result['qoq_growth']:
-        passed = False
-        reasons.append("环比未增长")
-    else:
-        reasons.append("环比+")
+        eps_negative=True 时改用「亏损收窄/扩大」描述（避免「亏损高 X%」误导）。
+        """
+        if fail:
+            return f"{base_word}下降"
+        if eps_negative:
+            if rate is None:
+                return f"{base_word}亏损"
+            if rate >= 0:
+                return f"{base_word}亏损收窄{abs(rate)*100:.1f}%"
+            return f"{base_word}亏损扩大{abs(rate)*100:.1f}%"
+        if rate is None:
+            return f"{base_word}增长"
+        verb = "高" if rate >= 0 else "低"
+        return f"{base_word}{verb}{abs(rate)*100:.1f}%"
 
-    eps_str = f"${result['latest_eps']:.2f}" if result['latest_eps'] else "N/A"
-    reason = f"EPS{eps_str}，" + "/".join(reasons)
+    yoy_phrase = _growth_phrase(
+        result.get('yoy_growth_rate'),
+        "比去年同期",
+        require_yoy and not result['yoy_growth'],
+        eps_negative,
+    )
+    qoq_phrase = _growth_phrase(
+        result.get('qoq_growth_rate'),
+        "比上季度",
+        require_qoq and not result['qoq_growth'],
+        eps_negative,
+    )
+
+    streak_parts = []
+    conq = result.get('consecutive_qoq_growth', 0)
+    cony = result.get('consecutive_yoy_growth', 0)
+    if conq >= 2:
+        streak_parts.append(f"最近{conq}个季度的EPS都比上季度高")
+    if cony >= 2:
+        streak_parts.append(f"最近{cony}个季度的EPS都比去年同期同季度高")
+
+    passed = (
+        (not require_yoy or result['yoy_growth'])
+        and (not require_qoq or result['qoq_growth'])
+    )
+
+    base = f"最新季度EPS{eps_str}，{yoy_phrase}，{qoq_phrase}"
+    reason = base + ("；" + "，".join(streak_parts) if streak_parts else "")
 
     return passed, reason
 

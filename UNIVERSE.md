@@ -9,7 +9,7 @@
 
 ---
 
-## 当前手动池总数：517 只（美股517）
+## 当前手动池总数：580 只（美股580）
 
 ---
 
@@ -520,6 +520,73 @@
 | ZBH | ZBH | S&P 500 成分股 |
 | ZBRA | ZBRA | S&P 500 成分股 |
 | ZTS | ZTS | S&P 500 成分股 |
+
+## 板块 M：手动添加
+
+| 代码 | 公司 | 简介 |
+|------|------|------|
+| AAOI | AAOI | 手动添加 |
+| AEHR | AEHR | 手动添加 |
+| AMKR | AMKR | 手动添加 |
+| ASX | ASX | 手动添加 |
+| CAMT | CAMT | 手动添加 |
+| CLS | CLS | 手动添加 |
+| COHR | COHR | 手动添加 |
+| FN | FN | 手动添加 |
+| FORM | FORM | 手动添加 |
+| GFS | GFS | 手动添加 |
+| HIMX | HIMX | 手动添加 |
+| LITE | LITE | 手动添加 |
+| LWLG | LWLG | 手动添加 |
+| MRVL | MRVL | 手动添加 |
+| MTSI | MTSI | 手动添加 |
+| MXL | MXL | 手动添加 |
+| NOK | NOK | 手动添加 |
+| ONTO | ONTO | 手动添加 |
+| POET | POET | 手动添加 |
+| SMTC | SMTC | 手动添加 |
+| TSEM | TSEM | 手动添加 |
+| UMC | UMC | 手动添加 |
+| VIAV | VIAV | 手动添加 |
+| VICR | VICR | 手动添加 |
+| AIRO | AIRO | 手动添加 |
+| ARM | ARM | 手动添加 |
+| AXTI | AXTI | 手动添加 |
+| CRWV | CRWV | 手动添加 |
+| HIMS | HIMS | 手动添加 |
+| IREN | IREN | 手动添加 |
+| LNG | LNG | 手动添加 |
+| MP | MP | 手动添加 |
+| NBIS | NBIS | 手动添加 |
+| NEXT | NEXT | 手动添加 |
+| RPI | RPI | 手动添加 |
+| SIVE | SIVE | 手动添加 |
+| SOI | SOI | 手动添加 |
+| TSM | TSM | 手动添加 |
+| WIN | WIN | 手动添加 |
+| XLU | XLU | 手动添加 |
+| CIFR | CIFR | 手动添加 |
+| HUT | HUT | 手动添加 |
+| WULF | WULF | 手动添加 |
+| WYFI | WYFI | 手动添加 |
+| ABTC | ABTC | 手动添加 |
+| APLD | APLD | 手动添加 |
+| BMNR | BMNR | 手动添加 |
+| BTCS | BTCS | 手动添加 |
+| BITF | BITF | 手动添加 |
+| BTDR | BTDR | 手动添加 |
+| CANG | CANG | 手动添加 |
+| CAN | CAN | 手动添加 |
+| CLSK | CLSK | 手动添加 |
+| CORZ | CORZ | 手动添加 |
+| DMGI | DMGI | 手动添加 |
+| GRYP | GRYP | 手动添加 |
+| HIVE | HIVE | 手动添加 |
+| KEEL | KEEL | 手动添加 |
+| MARA | MARA | 手动添加 |
+| PHX | PHX | 手动添加 |
+| RIOT | RIOT | 手动添加 |
+| SLNH | SLNH | 手动添加 |
 
 ## 操作说明
 
