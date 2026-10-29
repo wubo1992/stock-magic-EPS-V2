@@ -56,6 +56,8 @@ class WeinsteinStrategy(StrategyBase):
         super().__init__(strategy_config, market_data)
         self.live_mode = live_mode
         self.positions: dict[str, Position] = {}
+        # 持仓功能开关（用户偏好：v_eps_v2 仅做选股，不追踪出场）
+        self.positions_enabled = self.cfg.get("enable_positions", True)
 
         # Weinstein Stage 2 参数
         self.sma_long = self.cfg.get("sma_long", 150)
@@ -72,10 +74,11 @@ class WeinsteinStrategy(StrategyBase):
 
     def run_date(self, date: datetime, queue: EventQueue) -> list[SignalEvent]:
         signals = []
-        exit_signals = self._check_exits(date)
-        for sig in exit_signals:
-            queue.put(sig)
-            signals.append(sig)
+        if self.positions_enabled:
+            exit_signals = self._check_exits(date)
+            for sig in exit_signals:
+                queue.put(sig)
+                signals.append(sig)
 
         for symbol, df in self.market_data.items():
             if symbol in ("SPY", "^VIX"):

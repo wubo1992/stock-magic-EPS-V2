@@ -13,6 +13,10 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+# 信号类型常量（events/base.py 是 SignalEvent 的源头，signals/generator.py 从这里导入）
+V_EPS_V2_BUY_SIGNAL_TYPE = "v_eps_v2_buy"
+CROSSBACK_BUY_SIGNAL_TYPE = "crossback_buy"
+
 
 class EventType(str, Enum):
     """
@@ -95,6 +99,11 @@ class SignalEvent(Event):
         reason:     触发原因（一句话描述）
         stop_loss:  建议止损价
         shares:     持仓股数（用户手动填写在 positions.json 中）
+        signal_type: 信号类型标识，默认 "v_eps_v2_buy"，
+                    crossback 信号设为 "crossback_buy"
+        signal_price: 信号当日收盘价（USD），用于 watchlist 持久化
+        rs_data:    结构化相对强度数据（RS相对强度/RS/SPY/RS-10W/RS-10D/板块排名），
+                    缺失时为 None —— signals.csv 的 RS 列从这里取值
     """
 
     @classmethod
@@ -107,6 +116,9 @@ class SignalEvent(Event):
         reason: str,
         stop_loss: float | None = None,
         shares: float = 0.0,
+        signal_type: str = V_EPS_V2_BUY_SIGNAL_TYPE,  # NEW: distinguishes v_eps_v2 vs crossback
+        signal_price: float | None = None,  # NEW: close on signal day, for watchlist
+        rs_data: dict[str, Any] | None = None,  # NEW: structured RS columns for signals.csv
     ) -> "SignalEvent":
         return cls(
             type=EventType.SIGNAL,
@@ -118,5 +130,8 @@ class SignalEvent(Event):
                 "reason": reason,
                 "stop_loss": stop_loss,
                 "shares": shares,
+                "signal_type": signal_type,
+                "signal_price": signal_price,
+                "rs_data": rs_data,
             },
         )

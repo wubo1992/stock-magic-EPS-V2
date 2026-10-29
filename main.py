@@ -25,6 +25,7 @@ main.py — 事件驱动交易信号系统入口
 """
 
 import argparse
+import logging
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -35,14 +36,29 @@ from dotenv import load_dotenv
 
 from backtest.engine import BacktestEngine
 from data.fetcher import fetch
+from data.rs_universe import update_universe_store
 from events import EventQueue
-from signals.generator import process_signals
+from signals.generator import OUTPUT_DIR, _event_to_record, drain_signals, process_signals
 from signals.log_generator import update_signals_log
 from signals.positions import load_positions, save_positions
-from signals.report import generate_daily_report
+from signals.report import (
+    compute_recent_signal_pnl,
+    generate_crossback_report,
+    generate_daily_report,
+    make_rs_refresher,
+)
+from strategies.ema_crossback import (
+    add_signals_to_watchlist,
+    load_watchlist,
+    prune_expired,
+    run_ema_crossback_strategy,
+)
+from strategies.ema_crossback.watchlist import save_watchlist
 from strategies.registry import get_strategy
 from universe.manager import get_universe, _read_universe_md
 from universe.updater import run_scan
+
+logger = logging.getLogger(__name__)
 
 # 加载 .env 文件（Alpaca API Key 等）
 _env_path = Path(__file__).parent / ".env"
@@ -115,6 +131,15 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
             if data and benchmark in data:
                 market_data[benchmark] = data[benchmark]
 
+    # RS 排名池宽表必须跟着本轮抓的数据走，否则排名池会停留在上一次的快照上
+    # —— 池子组成没变但现价变了，RS Rating 整体偏移，而且日志里看不出来。
+    # 数据源就是上面刚写完 pkl 的内存 market_data，额外网络成本为零。
+    try:
+        wide = update_universe_store(market_data)
+        print(f"[RS 排名池] 宽表已更新：{wide.shape[1]} 只 × {wide.shape[0]} 个交易日")
+    except Exception as exc:
+        print(f"[RS 排名池] 宽表更新失败（将回退逐只 pkl 计算）：{exc}")
+
     # 确保 VIX 在 market_data 中（用于市场状态检测）
     if "^VIX" not in market_data:
         vix_data = fetch(["^VIX"], history_days=history_days, live_mode=True)
@@ -127,17 +152,23 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
     # v_trend_collection 分支在本精简版中不可用，直接初始化策略
     strategy = strategy_cls(strategy_config, market_data, live_mode=True)
 
-    # 载入上次持仓（跨天追踪出场条件）
-    saved_positions = load_positions(strategy_id)
-    if saved_positions:
-        strategy.positions = saved_positions
-        print(f"[持仓] 已加载 {len(saved_positions)} 个持仓：{', '.join(saved_positions.keys())}")
-    else:
-        print("[持仓] 暂无持仓记录")
+    # 持仓功能开关（用户偏好：v_eps_v2 仅做选股，不追踪持仓）
+    positions_enabled = strategy_config.get("enable_positions", True)
 
-    # 快照持仓引用：出场信号发出后策略会自动删除持仓，需在运行后恢复
-    # （Position 对象是原地修改的，快照保存引用即可，days_held/highest_price 更新会同步体现）
-    pre_run_snapshot = dict(strategy.positions)
+    # 载入上次持仓（跨天追踪出场条件）
+    saved_positions = {}
+    pre_run_snapshot = {}
+    if positions_enabled:
+        saved_positions = load_positions(strategy_id)
+        if saved_positions:
+            strategy.positions = saved_positions
+            print(f"[持仓] 已加载 {len(saved_positions)} 个持仓：{', '.join(saved_positions.keys())}")
+        else:
+            print("[持仓] 暂无持仓记录")
+
+        # 快照持仓引用：出场信号发出后策略会自动删除持仓，需在运行后恢复
+        # （Position 对象是原地修改的，快照保存引用即可，days_held/highest_price 更新会同步体现）
+        pre_run_snapshot = dict(strategy.positions)
 
     queue = EventQueue()
     today = datetime.now(tz=timezone.utc)
@@ -145,30 +176,120 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
     t4 = time.time()
     print(f"[耗时] 策略计算: {t4-t3:.1f}秒")
 
-    # 恢复被出场信号自动删除的持仓
-    # 用户手动告知平仓前，系统每日持续发出提醒信号
-    for symbol, pos in pre_run_snapshot.items():
-        if symbol not in strategy.positions:
-            strategy.positions[symbol] = pos
+    if positions_enabled:
+        # 恢复被出场信号自动删除的持仓
+        # 用户手动告知平仓前，系统每日持续发出提醒信号
+        for symbol, pos in pre_run_snapshot.items():
+            if symbol not in strategy.positions:
+                strategy.positions[symbol] = pos
 
-    # 保存更新后的持仓（新买入已加入；已出场的保留，等待用户确认平仓）
-    save_positions(strategy.positions, strategy_id)
-    if strategy.positions:
-        print(f"[持仓] 已保存 {len(strategy.positions)} 个持仓：{', '.join(strategy.positions.keys())}")
+        # 保存更新后的持仓（新买入已加入；已出场的保留，等待用户确认平仓）
+        save_positions(strategy.positions, strategy_id)
+        if strategy.positions:
+            print(f"[持仓] 已保存 {len(strategy.positions)} 个持仓：{', '.join(strategy.positions.keys())}")
 
-    # 输出信号
-    records = process_signals(queue, config, strategy_id=strategy_id)
+    # === Crossback 集成（spec §6.2） ===
+    # 1. Drain v_eps_v2 信号（保留 events 供 watchlist 更新 + crossback 输入）
+    v_eps_events = drain_signals(queue)
+
+    # 读取 ema_crossback 配置（spec §7）
+    cb_cfg = config.get("ema_crossback", {})
+
+    # 2. 更新 watch list（spec §4.1）
+    watchlist_path = OUTPUT_DIR / strategy_id / "watchlist.json"
+    watchlist = load_watchlist(watchlist_path)
+
+    # 把 v_eps_v2 信号转为 watchlist 条目（spec §6.2 core要点 #4）
+    new_entries = []
+    for evt in v_eps_events:
+        if evt.data.get("signal_type") == "v_eps_v2_buy":
+            signal_price = evt.data.get("signal_price")
+            if signal_price is None:
+                logger.warning(f"[main] {evt.symbol} missing signal_price, skipping watchlist")
+                continue
+            stage2_stop = evt.data.get("stop_loss")  # already = signal_price * 0.92
+            new_entries.append({
+                "symbol": evt.symbol,
+                "signal_date": evt.timestamp.strftime("%Y-%m-%d"),
+                "signal_price": signal_price,
+                "stage2_stop": stage2_stop,
+            })
+
+    watchlist = add_signals_to_watchlist(
+        watchlist,
+        new_entries,
+        expire_days=cb_cfg.get("watchlist_expire_days", 60),
+        today=today,
+    )
+    watchlist = prune_expired(watchlist, today)
+
+    # 3. 运行 crossback 策略
+    crossback_events = []
+    if cb_cfg.get("enabled", True):
+        crossback_events = run_ema_crossback_strategy(
+            watchlist,
+            market_data=market_data,
+            today=today,
+            cache_dir=Path("data/cache"),
+            ema_period=cb_cfg.get("ema_period", 10),
+            vol_mult=cb_cfg.get("volume_mult", 1.5),
+            vol_lookback=cb_cfg.get("volume_lookback", 20),
+        )
+
+    # CRITICAL：必须无条件持久化 watchlist —— run_ema_crossback_strategy
+    # 会在内存中直接修改入参 watchlist 的 crossback_count / last_crossback_date
+    save_watchlist(watchlist, watchlist_path)
+
+    # 4. 合并 v_eps_v2 + crossback events，统一输出
+    combined_queue = EventQueue()
+    for e in v_eps_events:
+        combined_queue.put(e)
+    for e in crossback_events:
+        combined_queue.put(e)
+    records = process_signals(combined_queue, config, strategy_id=strategy_id)
     if not records:
         print("\n今日无有效信号。")
         print("（SEPA 条件严格，无信号是正常的。有信号时才需要关注。）")
 
-    # 生成每日 Markdown 报告（无论有无信号都生成）
+    # 5. 生成报告（含 v_eps_v2 + crossback 两类）
+    # 今日触发按严格当日口径统计（避免把自信号日以来的累计 crossback 误报为今日触发）
+    _today_str = today.strftime("%Y-%m-%d")
+    _triggered_today = {
+        e.symbol for e in crossback_events
+        if e.timestamp.strftime("%Y-%m-%d") == _today_str
+    }
+    recent_pnl = compute_recent_signal_pnl(watchlist, today, Path("data/cache"))
     report_path = generate_daily_report(
         records,
         strategy_id=strategy_id,
         strategy_name=strategy_name,
+        crossback_records=[r for r in records if r.get("信号类型") == "crossback_buy"],
+        watchlist_status={
+            "total": len(watchlist),
+            "added_today": len(new_entries),
+            "triggered_today": len(_triggered_today),
+            "triggered_cumulative": len({e.symbol for e in crossback_events}),
+            "recent_pnl": recent_pnl,
+        },
+        watchlist=watchlist,
+        # 历史信号的 RS 按当前排名池口径重算：CSV 里写死的是信号发出当天的旧池子
+        # 数字，排名池扩过之后跟今天新算的对不上（同一个信号两个 RS Rating）。
+        rs_compute=make_rs_refresher(market_data),
     )
     print(f"\n[报告] 今日报告：{report_path}")
+
+    # 6. 独立 crossback 报告（spec §4.3）
+    if cb_cfg.get("output", {}).get("generate_independent_report", True):
+        cb_report_path = generate_crossback_report(
+            records=[_event_to_record(e) for e in crossback_events],
+            watchlist=watchlist,
+            strategy_id=strategy_id,
+            today=today,
+            recent_pnl=recent_pnl,
+            cache_dir=Path("data/cache"),
+        )
+        if cb_report_path:
+            print(f"[报告] Crossback 报告：{cb_report_path}")
 
     # 更新全策略信号汇总日志
     t5 = time.time()
@@ -211,13 +332,13 @@ def run_backtest(
     print(f"测试区间：{start_str} 至 {end_str}")
     print("=" * 60)
 
-    # 使用手动股票池（回测不抓取新闻，从 UNIVERSE.md 读取）
-    manual_symbols = _read_universe_md()
-    if not manual_symbols:
-        print("[错误] 回测模式找不到股票池，请检查 UNIVERSE.md 是否存在且包含股票")
+    # 使用完整股票池（和 live mode 一样）
+    symbols = get_universe(config)
+    if not symbols:
+        print("[错误] 回测模式找不到股票池")
         sys.exit(1)
 
-    print(f"\n股票池：{manual_symbols}")
+    print(f"\n股票池：{symbols[:50]}{'...' if len(symbols) > 50 else ''} (共{len(symbols)}只)")
 
     if split:
         # 自动拆分：前 2/3 为样本内，后 1/3 为样本外
@@ -232,7 +353,7 @@ def run_backtest(
         print("运行样本内回测...")
         _run_single_backtest(
             config, strategy_cls, strategy_config, strategy_name,
-            manual_symbols, start_date, split_point, "样本内",
+            symbols, start_date, split_point, "样本内",
             save_signals=save_signals,
             position_size=position_size,
             initial_capital=initial_capital,
@@ -242,7 +363,7 @@ def run_backtest(
         print("运行样本外回测（OOS）...")
         _run_single_backtest(
             config, strategy_cls, strategy_config, strategy_name,
-            manual_symbols, split_point, end_date, "样本外 OOS ← 真正的考试",
+            symbols, split_point, end_date, "样本外 OOS ← 真正的考试",
             save_signals=save_signals,
             position_size=position_size,
             initial_capital=initial_capital,
@@ -250,7 +371,7 @@ def run_backtest(
     else:
         _run_single_backtest(
             config, strategy_cls, strategy_config, strategy_name,
-            manual_symbols, start_date, end_date,
+            symbols, start_date, end_date,
             save_signals=save_signals,
             position_size=position_size,
             initial_capital=initial_capital,
@@ -468,27 +589,35 @@ def main() -> None:
             else:
                 strategy = strategy_cls(strategy_config, market_data, live_mode=True)
 
-            saved_positions = load_positions(strategy_id)
-            if saved_positions:
-                strategy.positions = saved_positions
-                print(f"[持仓] 已加载 {len(saved_positions)} 个持仓：{', '.join(saved_positions.keys())}")
-            else:
-                print("[持仓] 暂无持仓记录")
+            # 持仓功能开关（用户偏好：仅做选股）
+            positions_enabled = strategy_config.get("enable_positions", True)
 
-            pre_run_snapshot = dict(strategy.positions)
+            saved_positions = {}
+            pre_run_snapshot = {}
+            if positions_enabled:
+                saved_positions = load_positions(strategy_id)
+                if saved_positions:
+                    strategy.positions = saved_positions
+                    print(f"[持仓] 已加载 {len(saved_positions)} 个持仓：{', '.join(saved_positions.keys())}")
+                else:
+                    print("[持仓] 暂无持仓记录")
+
+                pre_run_snapshot = dict(strategy.positions)
+
             queue = EventQueue()
             today = datetime.now(tz=timezone.utc)
             strategy.run_date(today, queue)
             t2 = time.time()
             print(f"[耗时] 策略计算: {t2-t1:.1f}秒")
 
-            for symbol, pos in pre_run_snapshot.items():
-                if symbol not in strategy.positions:
-                    strategy.positions[symbol] = pos
+            if positions_enabled:
+                for symbol, pos in pre_run_snapshot.items():
+                    if symbol not in strategy.positions:
+                        strategy.positions[symbol] = pos
 
-            save_positions(strategy.positions, strategy_id)
-            if strategy.positions:
-                print(f"[持仓] 已保存 {len(strategy.positions)} 个持仓：{', '.join(strategy.positions.keys())}")
+                save_positions(strategy.positions, strategy_id)
+                if strategy.positions:
+                    print(f"[持仓] 已保存 {len(strategy.positions)} 个持仓：{', '.join(strategy.positions.keys())}")
 
             records = process_signals(queue, config, strategy_id=strategy_id)
             if not records:

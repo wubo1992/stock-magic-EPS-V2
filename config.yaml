@@ -52,6 +52,9 @@ strategies:
     name: "Weinstein + EPS (优化版)"
     description: "Weinstein Stage 2 技术框架 + EPS 增长筛选（冠军参数：OOS夏普1.39，2016-2026年化6.4%）"
 
+    # 用户偏好：禁用持仓功能，只做选股
+    enable_positions: false
+
     # Weinstein Stage 2 技术参数
     sma_long: 150
     trend_lookback: 30
@@ -68,6 +71,10 @@ strategies:
     eps_quarters_required: 2
     eps_yoy_required: true
     eps_qoq_required: true
+
+    # RS 集成（仅作展示，不影响信号生成）
+    rs_enabled: true
+    rs_fail_silent: true
 
   # ================================================================
   # 捡烟蒂V1A：纯格雷厄姆NCAV深度价值
@@ -163,3 +170,17 @@ scan:
   min_market_cap_b: 1.0
   max_new_per_run: 30
   request_delay_seconds: 1.2
+
+# ------------------------------------------------------------
+# EMA 10 Crossback strategy (spec §7)
+# ------------------------------------------------------------
+ema_crossback:
+  enabled: true                    # 总开关
+  ema_period: 10                   # EMA 周期
+  volume_mult: 1.5                 # 量能倍数阈值（crossback 当日量 ÷ 20日均量）
+  volume_lookback: 20              # 量能回看天数
+  watchlist_expire_days: 60        # watch list 过期天数
+  output:
+    append_to_main_csv: true       # 是否追加到 signals.csv
+    generate_independent_report: true  # 是否生成独立 crossback 报告
+    append_section_to_v_eps_v2_report: true  # 是否在 v_eps_v2 报告末尾加 crossback 区段
