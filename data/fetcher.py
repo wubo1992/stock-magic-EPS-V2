@@ -44,6 +44,20 @@ import requests
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Alpaca 批次失败时二分拆批的最大层数。200 只 -> 1 只需 log2(200) ≈ 8 层，
+# 留到 12 层做余量，保证递归一定收敛。
+_MAX_BATCH_SPLIT_DEPTH = 12
+
+# Yahoo 回退（Alpaca 覆盖不到的 ADR / OTC 代码）的上限与熔断。
+#
+# 2026-10-26 实测：无上限时 107 只回退花了 327.6 秒，而它们**一只都取不到**
+# （403 IP 级限流）。上限 20 只 + 连续 403 熔断，把这段从 5 分半压到 1 分钟内。
+YAHOO_FALLBACK_MAX_SYMBOLS = 20
+_YAHOO_403_STREAK_LIMIT = 10
+
+# 取不到的代码记到这里（追加），不静默丢
+FAILED_DOWNLOADS_PATH = Path(__file__).parent / "download_failed.txt"
+
 # ─── Yahoo Finance 备用接口 ────────────────────────────────────────
 _YF_API = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 _HEADERS = {
@@ -123,6 +137,10 @@ def fetch(
             if (end_date - last).days <= max_age:
                 # Tier 1：本地数据足够新，直接使用
                 result[symbol] = local
+            elif (end_date - last).days > 60:
+                # Tier 3：本地数据太旧（>60天），当无数据处理，全量下载
+                # 避免旧缓存（如2018年数据）拉低全局 delta_start
+                need_full.append(symbol)
             else:
                 # Tier 2：本地有历史，但需要增量补充
                 need_update.append((symbol, local))
@@ -169,8 +187,14 @@ def fetch(
 
             still_missing = [s for s in us_full if s not in alpaca_result]
             if still_missing:
-                print(f"[数据] Alpaca 未覆盖 {len(still_missing)} 只，尝试 Yahoo Finance...")
-                yahoo_result = _fetch_via_yahoo(still_missing, start_date, end_date, history_days)
+                print(f"[数据] Alpaca 未覆盖 {len(still_missing)} 只，fallback 到 Yahoo Finance...")
+                yahoo_result = _fetch_via_yahoo(
+                    still_missing,
+                    start_date,
+                    end_date,
+                    history_days,
+                    max_symbols=YAHOO_FALLBACK_MAX_SYMBOLS,
+                )
                 for symbol, df in yahoo_result.items():
                     result[symbol] = df
                     _save_local(symbol, df)
@@ -194,20 +218,15 @@ def fetch(
                     # Alpha Vantage 可能有更早的数据，合并
                     existing = result.get(symbol)
                     if existing is not None and not existing.empty:
-                        # 确保时区一致：统一转换为 UTC 再合并
-                        if df.index.tz is None and existing.index.tz is not None:
-                            df = df.copy()
-                            df.index = df.index.tz_localize("UTC")
-                        elif df.index.tz is not None and existing.index.tz is None:
-                            existing = existing.copy()
-                            existing.index = existing.index.tz_localize("UTC")
-                        merged = pd.concat([df, existing])
-                        merged = merged[~merged.index.duplicated(keep="last")]
-                        merged = merged.sort_index()
+                        # 同样按交易日去重（见 _merge_delta）
+                        merged = _merge_delta(existing, df)
                         result[symbol] = merged
+                        # 存合并后的结果 —— 原来存的是 df（只有 AV 那份），
+                        # 磁盘上的文件和内存里算 RS 的那份对不上。
+                        _save_local(symbol, merged)
                     else:
                         result[symbol] = df
-                    _save_local(symbol, df)
+                        _save_local(symbol, df)
 
     # ── 第三步：增量更新（使用 Alpaca + Yahoo 备用）────────────────────────────
     if need_update:
@@ -254,25 +273,28 @@ def fetch(
             us_update_tuples = [(s, df) for s, df in need_update if _is_us_stock(s)]
             new_data_alpaca = _fetch_via_alpaca(us_update, delta_start, end_date)
 
-            # Alpaca 不支持的股票走 Yahoo Finance 增量补充
+            # Alpaca 不支持的股票 fallback 到 Yahoo Finance 增量补充
             alpaca_missed = [s for s in us_update if s not in new_data_alpaca]
             if alpaca_missed:
-                print(f"[数据] 增量更新：Alpaca 未覆盖 {len(alpaca_missed)} 只，尝试 Yahoo Finance...")
-                yahoo_delta2 = _fetch_via_yahoo(alpaca_missed, delta_start, end_date, 30)
-                new_data_alpaca.update(yahoo_delta2)
+                print(f"[数据] 增量更新：Alpaca 未覆盖 {len(alpaca_missed)} 只，fallback 到 Yahoo Finance...")
+                yahoo_delta = _fetch_via_yahoo(
+                    alpaca_missed,
+                    delta_start,
+                    end_date,
+                    30,
+                    max_symbols=YAHOO_FALLBACK_MAX_SYMBOLS,
+                )
+                new_data.update(yahoo_delta)
 
             new_data.update(new_data_alpaca)
 
         for symbol, existing_df in need_update:
             new_rows = new_data.get(symbol)
             if new_rows is not None and not new_rows.empty:
-                # 确保时区一致：统一转换为 UTC 再合并
-                if existing_df.index.tz is None and new_rows.index.tz is not None:
-                    existing_df = existing_df.copy()
-                    existing_df.index = existing_df.index.tz_localize("UTC")
-                merged = pd.concat([existing_df, new_rows])
-                merged = merged[~merged.index.duplicated(keep="last")]
-                merged = merged.sort_index()
+                # 按**交易日**去重（见 _merge_delta）：按时间戳去重会让
+                # Alpaca(04:00) 和 Yahoo(00:00) 的同一个交易日同时留在文件里，
+                # 一份文件两套价格基准，RS 就算错了。
+                merged = _merge_delta(existing_df, new_rows)
                 result[symbol] = merged
                 _save_local(symbol, merged)
             else:
@@ -282,6 +304,59 @@ def fetch(
     print(f"[数据] 成功获取 {len(result)}/{len(symbols)} 只股票的数据")
     print(f"[数据] 总耗时: {time.time()-t0:.1f}秒")
     return result
+
+
+def _merge_delta(existing_df: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    把增量数据并进已有行情，**按交易日**去重。
+
+    为什么不能按时间戳去重
+    ----------------------
+    两个数据源的日线 bar 时间戳不一样：
+
+        Alpaca → 04:00 UTC（美东当日零点）
+        Yahoo  → 00:00 UTC
+
+    按精确时间戳去重时，同一个交易日的两根 bar 会**同时留在文件里**。
+    而两套 bar 的价格基准还不一样 —— Alpaca 的 adjustment="all" 只做拆股复权，
+    Yahoo 的 adjclose 还做分红复权。一份文件里同时住着两套基准，算出来的
+    加权收益就是拿两套尺子做比值。
+
+    实测（2026-10-23，10,695 只行情 pkl）：5,366 只文件同时含 00:00 和
+    04:00 的 bar，其中 1,489 只的同日收盘价差 >2%（最大的差 10,415%）。
+    而 RS 排名池正是拿这些 close 算百分位 —— 差 2% 时排名错位看不出来，
+    差 100 倍时那只票的 RS 完全是另一个数。
+
+    规则：**文件里已有的那一天，以文件自己的 bar 为准**（保住它原本的价格
+    基准），增量只负责补上文件里还没有的交易日。这样文件不会因为一次
+    增量更新就沾上另一个源的基准。
+    """
+    if existing_df is None or existing_df.empty:
+        return new_rows
+    if new_rows is None or new_rows.empty:
+        return existing_df
+
+    # 时区对齐：一边有 tz 一边没有时，统一成有 tz 的那份
+    if existing_df.index.tz is None and new_rows.index.tz is not None:
+        existing_df = existing_df.copy()
+        existing_df.index = existing_df.index.tz_localize("UTC")
+    elif existing_df.index.tz is not None and new_rows.index.tz is None:
+        new_rows = new_rows.copy()
+        new_rows.index = new_rows.index.tz_localize("UTC")
+
+    if not isinstance(existing_df.index, pd.DatetimeIndex) or not isinstance(
+        new_rows.index, pd.DatetimeIndex
+    ):
+        # 不是时间索引就退回按时间戳去重（老行为）
+        merged = pd.concat([existing_df, new_rows])
+        return merged[~merged.index.duplicated(keep="last")].sort_index()
+
+    have = existing_df.index.normalize()
+    incoming = new_rows.index.normalize()
+    fresh = new_rows[~incoming.isin(have)]
+
+    merged = pd.concat([existing_df, fresh])
+    return merged.sort_index()
 
 
 def clear_cache(symbol: str | None = None) -> None:
@@ -351,6 +426,12 @@ def _fetch_via_alpaca(
 
     print(f"[数据] Alpaca 尝试下载 {len(symbols)} 只股票...")
 
+    # 过滤非 ASCII 字符的股票代码（如中文"代码"），防止整批请求失败
+    original_count = len(symbols)
+    symbols = [s for s in symbols if s.isascii()]
+    if len(symbols) < original_count:
+        print(f"[数据] 过滤 {original_count - len(symbols)} 个非 ASCII 代码")
+
     try:
         from alpaca.data.historical import StockHistoricalDataClient
     except ImportError:
@@ -380,9 +461,21 @@ def _alpaca_fetch_batch(
     start_date: datetime,
     end_date: datetime,
     bad_symbols: set[str],
+    _depth: int = 0,
 ) -> dict[str, pd.DataFrame]:
     """
-    Alpaca 单批次下载，遇到 "invalid symbol" 自动剔除并重试（最多剔除 10 个）。
+    Alpaca 单批次下载。
+
+    失败**绝不整批丢弃**：拆成两半分别重试，只有单只票反复失败才放弃它一只。
+
+    为什么不能整批丢：live run 的股票池有 6,000+ 只，混着 ADR、unit、
+    warrant 和早该退市的票。整批 `return {}` 会让 200 只票静默没有新数据，
+    日志只留一行「批次失败」—— 项目「成功跑完、什么错都没报」，但这些票
+    的 RS 拿的是上个月的旧价。
+
+    "invalid symbol" 的剔除上限也一并去掉了：原来剔满 10 个之后，
+    第 11 个无效代码会让**剩下整批**直接返回 {}。现在靠拆批定位坏代码，
+    好票不会陪葬。
     """
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
@@ -417,6 +510,22 @@ def _alpaca_fetch_batch(
         #     print(f"[调试] Alpaca 返回空数据，start_date={start_date}")
 
         if raw_df.empty:
+            # 空响应**不等于**「这批票都没数据」—— 拆批重试。
+            #
+            # 原来这里直接 return {}，一批 200 只静默消失，随后全部 fallback
+            # 到 Yahoo。Yahoo 的 bar 时间戳是 00:00 UTC、Alpaca 的是 04:00 UTC，
+            # 合并进已有文件后同一个交易日会留下两根 bar —— 双源污染的来源。
+            if len(clean) > 1 and _depth < _MAX_BATCH_SPLIT_DEPTH:
+                mid = len(clean) // 2
+                print(f"[数据] Alpaca 批次返回空数据（{len(clean)} 只），拆成两半重试")
+                left = _alpaca_fetch_batch(
+                    client, clean[:mid], start_date, end_date, bad_symbols, _depth + 1
+                )
+                right = _alpaca_fetch_batch(
+                    client, clean[mid:], start_date, end_date, bad_symbols, _depth + 1
+                )
+                return {**left, **right}
+            print(f"[数据] Alpaca 放弃代码 {clean[0] if clean else '?'}：返回空数据")
             return {}
 
         result: dict[str, pd.DataFrame] = {}
@@ -436,14 +545,32 @@ def _alpaca_fetch_batch(
         err_str = str(e)
         # 尝试从错误信息中提取无效 symbol，例如 {"message":"invalid symbol: BRK-B"}
         m = re.search(r"invalid symbol[:\s]+([A-Z0-9./\-]+)", err_str, re.IGNORECASE)
-        if m and len(bad_symbols) < 10:
+        if m:
             bad_sym = m.group(1).strip('",}')
-            print(f"[数据] Alpaca 跳过无效代码：{bad_sym}")
-            bad_symbols.add(bad_sym)
-            return _alpaca_fetch_batch(client, symbols, start_date, end_date, bad_symbols)
-        else:
-            print(f"[数据] Alpaca 批次失败：{e}")
-            return {}
+            # 只在「这个代码还没被剔过」时重试整批。否则报错会一直指着同一个
+            # 代码，整批重试变成死循环（旧实现那个 10 次上限就是被这个逼出来的）。
+            if bad_sym not in bad_symbols:
+                print(f"[数据] Alpaca 跳过无效代码：{bad_sym}")
+                bad_symbols.add(bad_sym)
+                return _alpaca_fetch_batch(
+                    client, symbols, start_date, end_date, bad_symbols, _depth
+                )
+
+        # 整批失败 -> 二分拆批重试，绝不让几百只票陪葬
+        if len(clean) > 1 and _depth < _MAX_BATCH_SPLIT_DEPTH:
+            mid = len(clean) // 2
+            print(f"[数据] Alpaca 批次失败（{len(clean)} 只），拆成两半重试：{e}")
+            left = _alpaca_fetch_batch(
+                client, clean[:mid], start_date, end_date, bad_symbols, _depth + 1
+            )
+            right = _alpaca_fetch_batch(
+                client, clean[mid:], start_date, end_date, bad_symbols, _depth + 1
+            )
+            return {**left, **right}
+
+        # 只剩一只票还失败 -> 放弃它一只（记下来，别静默）
+        print(f"[数据] Alpaca 放弃代码 {clean[0] if clean else '?'}：{e}")
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -552,20 +679,63 @@ def _fetch_via_yahoo(
     start_date: datetime,
     end_date: datetime,
     history_days: int,
+    max_symbols: int | None = None,
+    failed_path: Path = FAILED_DOWNLOADS_PATH,
 ) -> dict[str, pd.DataFrame]:
-    """逐只从 Yahoo Finance 下载，每只之间等待 2 秒防限流。"""
+    """
+    逐只从 Yahoo Finance 下载，每只之间等待 2 秒防限流。
+
+    max_symbols 是**回退上限**：Alpaca 覆盖不到的代码往往上百只，而 Yahoo 对
+    它们基本一只都取不到（403 IP 级限流）。2026-10-26 实测：无上限时
+    107 只回退花了 327.6 秒，live run 的数据获取有 86% 的时间耗在这上面。
+    超上限的代码记进 data/download_failed.txt，不静默丢。
+
+    连续 403 达到 _YAHOO_403_STREAK_LIMIT 就熔断：IP 级限流时继续打只会更糟。
+    """
     t0 = time.time()
     result: dict[str, pd.DataFrame] = {}
     session = requests.Session()
     session.headers.update(_HEADERS)
 
-    for i, symbol in enumerate(symbols):
+    failed: list[str] = []
+    todo = list(symbols)
+    if max_symbols is not None and len(todo) > max_symbols:
+        over = todo[max_symbols:]
+        failed.extend(over)
+        print(
+            f"[数据] Yahoo 回退上限 {max_symbols} 只，"
+            f"超出的 {len(over)} 只不再尝试（记入失败清单）"
+        )
+        todo = todo[:max_symbols]
+
+    streak_403 = 0
+    for symbol in todo:
+        if streak_403 >= _YAHOO_403_STREAK_LIMIT:
+            failed.append(symbol)
+            continue
         time.sleep(2)
-        df = _yahoo_download_one(symbol, history_days, session)
+        df, status = _yahoo_download_one(symbol, history_days, session)
+        if status == "rate_limited":
+            streak_403 += 1
+        else:
+            streak_403 = 0
         if df is not None and not df.empty:
             result[symbol] = df
         else:
-            print(f"[数据] 警告：{symbol} 无法获取数据，已跳过")
+            # 取不到就要留痕：被丢掉又没记录的代码，下一轮还会被当成
+            # 「没试过」，静悄悄地继续用陈旧数据算 RS。
+            failed.append(symbol)
+            if status != "rate_limited":
+                print(f"[数据] 警告：{symbol} 无法获取数据，已跳过")
+
+    if streak_403 >= _YAHOO_403_STREAK_LIMIT:
+        print(
+            f"[数据] Yahoo 连续 {streak_403} 次 403（IP 级限流），"
+            f"停止回退，剩余 {len(todo) - len(result)} 只记入失败清单"
+        )
+
+    if failed:
+        _record_failed_downloads(failed, "yahoo", path=failed_path)
 
     print(f"[数据] Yahoo 下载 {len(symbols)} 只，预计耗时: {len(symbols)*2/60:.1f}分钟，实际: {time.time()-t0:.1f}秒")
     return result
@@ -573,8 +743,16 @@ def _fetch_via_yahoo(
 
 def _yahoo_download_one(
     symbol: str, history_days: int, session: requests.Session
-) -> pd.DataFrame | None:
-    """单只股票的 Yahoo Finance 下载，403 直接跳过不重试。"""
+) -> tuple[pd.DataFrame | None, str]:
+    """
+    单只股票的 Yahoo Finance 下载。
+
+    返回 (数据, 状态)：
+      "ok"           取到数据
+      "rate_limited" 403（IP 级限流）—— 调用方据此熔断
+      "no_data"      响应正常但没有可用数据
+      "error"        其他异常
+    """
     print(f"[数据] Yahoo 下载 {symbol}...")
     try:
         url = _YF_API.format(symbol=symbol)
@@ -582,15 +760,35 @@ def _yahoo_download_one(
         resp = session.get(url, params=params, timeout=15)
         if resp.status_code == 403:
             print(f"[数据]   {symbol} 被限流（403），跳过")
-            return None
+            return None, "rate_limited"
         resp.raise_for_status()
         df = _parse_yahoo_response(resp.json())
         if df is not None and not df.empty:
-            return df
+            return df, "ok"
         print(f"[数据]   {symbol} 无有效数据，跳过")
+        return None, "no_data"
     except Exception as e:
         print(f"[数据]   {symbol} 下载失败：{e}")
-    return None
+        return None, "error"
+
+
+def _record_failed_downloads(
+    symbols: list[str], reason: str, path: Path = FAILED_DOWNLOADS_PATH
+) -> None:
+    """
+    把取不到的代码记进 data/download_failed.txt。
+
+    失败要留痕：被丢掉又没记录的代码，下一轮还会被当成「没试过」，
+    静悄悄地继续用陈旧数据算 RS。
+    """
+    if not symbols:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(path, "a", encoding="utf-8") as f:
+        for sym in symbols:
+            f.write(f"{stamp}\t{sym}\t{reason}\n")
 
 
 def _parse_yahoo_response(data: dict) -> pd.DataFrame | None:
