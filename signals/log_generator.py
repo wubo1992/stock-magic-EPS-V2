@@ -25,6 +25,11 @@ def load_signals_from_csv(strategy_id: str, date_str: str) -> tuple[list[dict], 
     """
     从策略的 signals.csv 加载指定日期的买入和卖出信号。
 
+    ⚠️ signals.csv 的列名是**中文**（日期 / 股票 / 信号 / …），这里取值必须用
+    中文列名再映射成生成器用的英文 key。2026-10-30 之前这里读的是英文列名
+    （date / direction），一条都读不出来 → SIGNALS_LOG.md 从 2026-04-01 起
+    就再没更新过，而且日志里看不出来（except Exception: pass）。
+
     返回: (buy_signals, sell_signals)
     """
     csv_path = OUTPUT_DIR / strategy_id / "signals.csv"
@@ -34,21 +39,36 @@ def load_signals_from_csv(strategy_id: str, date_str: str) -> tuple[list[dict], 
     buy_signals = []
     sell_signals = []
 
+    # CSV 里的方向是中文，生成器那边按英文 buy/sell 判断
+    _DIRECTION_MAP = {"买入": "buy", "卖出": "sell", "sell_partial": "sell_partial"}
+
     try:
         import csv
-        with open(csv_path, "r", encoding="utf-8") as f:
+        # utf-8-sig：signals.csv 带 BOM，用 utf-8 读第一个列名会变成 "﻿日期"
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                date = row.get("date", "")[:10]
+                date = (row.get("日期") or "").strip()[:10]
                 if date != date_str:
                     continue
-                direction = row.get("direction", "").strip()
+                raw_direction = (row.get("信号") or "").strip()
+                direction = _DIRECTION_MAP.get(raw_direction, raw_direction)
+                record = {
+                    "date": date,
+                    "symbol": (row.get("股票") or "").strip(),
+                    "direction": direction,
+                    "strength": (row.get("强度(1-5)") or "").strip(),
+                    "reason": row.get("触发原因") or "",
+                    # 去掉 $ —— 生成器输出时会自己补一个，否则出现 "$$55.95"
+                    "stop_loss": (row.get("参考止损") or "").strip().lstrip("$"),
+                    "signal_type": (row.get("信号类型") or "").strip(),
+                }
                 if direction == "buy":
-                    buy_signals.append(row)
+                    buy_signals.append(record)
                 elif direction in ("sell", "sell_partial"):
-                    sell_signals.append(row)
-    except Exception:
-        pass
+                    sell_signals.append(record)
+    except Exception as e:
+        print(f"[信号日志] 读取 {csv_path} 失败: {e}")
 
     return buy_signals, sell_signals
 
@@ -276,10 +296,17 @@ def update_signals_log(date_str: str | None = None) -> None:
 
 """
     # 移除旧头部
-    if existing_content.startswith("# 信号汇总日志"):
+    # 历史文件的表头是「# 全策略信号汇总日志」，新表头是「# 信号汇总日志（v_eps_v2）」——
+    # 用正则匹配任意「# …信号汇总日志」标题，否则旧表头留着会叠成两个表头。
+    if re.match(r"^#\s.*信号汇总日志", existing_content):
         match = re.search(r"^---\n+", existing_content, re.MULTILINE)
         if match:
             existing_content = existing_content[match.end():]
+        else:
+            # 没有分隔线：只去掉标题行，正文保留
+            existing_content = re.sub(
+                r"^#\s.*信号汇总日志.*\n+", "", existing_content, count=1
+            )
 
     # 写入文件
     with open(SIGNALS_LOG_FILE, "w", encoding="utf-8") as f:
