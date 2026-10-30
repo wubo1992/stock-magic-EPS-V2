@@ -221,8 +221,13 @@ def test_event_to_record_without_rs_data_falls_back_to_reason():
     assert record["板块排名"] == "1/180"
 
 
-def test_csv_migration_does_not_affect_other_strategies(tmp_path, monkeypatch):
-    """When strategy_id is NOT 'v_eps_v2', don't trigger migration."""
+def test_csv_migration_applies_to_other_strategies_too(tmp_path, monkeypatch):
+    """迁移必须对所有策略生效 —— 追加写的是 12 列，旧文件不迁移就会列错位。
+
+    2026-10-30 真实故障：迁移被 gate 在 v_eps_v2 上，v_weinstein 的 7 列文件
+    没迁移，12 字段的行塞进 7 列表头 → 读回来「强度(1-5)」= 'v_eps_v2_buy'
+    → 报告里 int() 抛 ValueError → 整轮 --all-strategies 扫描死掉。
+    """
     from signals import generator as gen_module
 
     # Redirect module-level OUTPUT_DIR to tmp_path so tests are isolated
@@ -241,7 +246,7 @@ def test_csv_migration_does_not_affect_other_strategies(tmp_path, monkeypatch):
         "日期": "2026-08-24",
         "股票": "Y",
         "信号": "买入",
-        "信号类型": V_EPS_V2_BUY_SIGNAL_TYPE,
+        "信号类型": "other_strategy_buy",
         "强度(1-5)": 3,
         "强度星级": "★★★☆☆",
         "触发原因": "test",
@@ -249,7 +254,13 @@ def test_csv_migration_does_not_affect_other_strategies(tmp_path, monkeypatch):
     }
     gen_module._append_to_csv([new_record], strategy_id="other_strategy")
 
-    # File should still have 6-column header (no migration triggered)
     text = csv_file.read_text(encoding="utf-8-sig")
     lines = text.strip().split("\n")
-    assert len(lines[0].split(",")) == 6, f"Other strategies should not be migrated: {lines[0]}"
+    assert len(lines[0].split(",")) == 12, f"Other strategies must be migrated too: {lines[0]}"
+
+    import csv as _csv
+    with open(csv_file, encoding="utf-8-sig") as f:
+        rows = list(_csv.DictReader(f))
+    # 列没被挤歪
+    assert rows[0]["强度(1-5)"] == "3"
+    assert rows[0]["信号类型"] == "other_strategy_buy"

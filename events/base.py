@@ -99,8 +99,9 @@ class SignalEvent(Event):
         reason:     触发原因（一句话描述）
         stop_loss:  建议止损价
         shares:     持仓股数（用户手动填写在 positions.json 中）
-        signal_type: 信号类型标识，默认 "v_eps_v2_buy"，
-                    crossback 信号设为 "crossback_buy"
+        signal_type: 信号类型标识。留空（None）时由 signals/generator.py
+                    按「策略 ID + 方向」推导（如 v_eps_v2_buy / v_weinstein_buy）；
+                    crossback 信号显式设为 "crossback_buy"
         signal_price: 信号当日收盘价（USD），用于 watchlist 持久化
         rs_data:    结构化相对强度数据（RS相对强度/RS/SPY/RS-10W/RS-10D/板块排名），
                     缺失时为 None —— signals.csv 的 RS 列从这里取值
@@ -116,7 +117,7 @@ class SignalEvent(Event):
         reason: str,
         stop_loss: float | None = None,
         shares: float = 0.0,
-        signal_type: str = V_EPS_V2_BUY_SIGNAL_TYPE,  # NEW: distinguishes v_eps_v2 vs crossback
+        signal_type: str | None = None,  # None = 按策略推导，见 signals/generator.py
         signal_price: float | None = None,  # NEW: close on signal day, for watchlist
         rs_data: dict[str, Any] | None = None,  # NEW: structured RS columns for signals.csv
     ) -> "SignalEvent":

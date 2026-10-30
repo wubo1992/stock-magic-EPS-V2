@@ -76,7 +76,7 @@ def process_signals(
         if event is None:
             break
         if event.type == EventType.SIGNAL:
-            record = _event_to_record(event)
+            record = _event_to_record(event, strategy_id=strategy_id)
             records.append(record)
 
     if not records:
@@ -99,14 +99,27 @@ def format_signals(signals: list[SignalEvent]) -> list[dict]:
     return [_event_to_record(s) for s in signals]
 
 
-def _event_to_record(event: SignalEvent) -> dict:
+def _default_signal_type(strategy_id: str | None, direction: str) -> str:
+    """按「策略 ID + 方向」推导信号类型。
+
+    以前所有策略都共用 "v_eps_v2_buy" 这一个默认值 —— 于是 v_weinstein 的信号
+    在自己的 signals.csv 里也被标成 v_eps_v2_buy。除了标签难看，更麻烦的是
+    它会挤歪旧 schema 文件的列（见 _append_to_csv 的迁移逻辑）。
+    """
+    if not strategy_id:
+        return V_EPS_V2_BUY_SIGNAL_TYPE
+    suffix = {"buy": "buy", "sell": "sell", "watch": "watch"}.get(direction, "buy")
+    return f"{strategy_id}_{suffix}"
+
+
+def _event_to_record(event: SignalEvent, strategy_id: str | None = None) -> dict:
     """把 SignalEvent 转换成可输出的字典。"""
     date_str = event.timestamp.strftime("%Y-%m-%d")
     direction = event.data.get("direction", "watch")
     strength = event.data.get("strength", 0)
     reason = event.data.get("reason", "")
     stop_loss = event.data.get("stop_loss")
-    signal_type = event.data.get("signal_type", V_EPS_V2_BUY_SIGNAL_TYPE)  # NEW
+    signal_type = event.data.get("signal_type") or _default_signal_type(strategy_id, direction)
 
     stop_str = f"${stop_loss:.2f}" if stop_loss is not None else "—"
     stars = "★" * strength + "☆" * (5 - strength)
@@ -115,7 +128,7 @@ def _event_to_record(event: SignalEvent) -> dict:
         "日期": date_str,
         "股票": event.symbol,
         "信号": _DIRECTION_CN.get(direction, direction),
-        "信号类型": signal_type,  # NEW
+        "信号类型": signal_type,
         "强度(1-5)": strength,
         "强度星级": stars,
         "触发原因": reason,
@@ -193,21 +206,22 @@ def _print_table(records: list[dict]) -> None:
 def _append_to_csv(records: list[dict], strategy_id: str = "v1_wizard") -> None:
     """把信号追加写入 CSV 文件（如果不存在则创建并写入表头）。
 
-    迁移逻辑（仅 v_eps_v2）：
+    迁移逻辑（所有策略）：
         - 若 signals.csv 已存在且 header 列数在 _OLD_SCHEMA_VERSIONS 中（6 或 7）
         - 自动重写整个文件：补齐缺失的 "信号类型" 列和 5 个 RS 列
           （RS 列从 触发原因 自由文本回填，老记录没有 RS-Rating 就留空）
         - 备份原文件为 signals.csv.bak.schema_v1 / .v2
+
+    ⚠️ 迁移必须对**所有**策略生效。追加用的是全局 `_CSV_HEADERS`（12 列），
+    旧文件不迁移就会「12 字段的行塞进 7 列表头的文件」→ 列错位 →
+    读回来「强度(1-5)」= 信号类型的值 → int() 抛 ValueError，整轮扫描死掉。
     """
     strategy_dir = OUTPUT_DIR / strategy_id
     strategy_dir.mkdir(parents=True, exist_ok=True)
     signals_csv = strategy_dir / "signals.csv"
 
-    # v_eps_v2 migration: 6-col / 7-col → 12-col header
-    if (
-        strategy_id == V_EPS_V2_STRATEGY_ID
-        and signals_csv.exists()
-    ):
+    # migration: 6-col / 7-col → 12-col header（不限策略）
+    if signals_csv.exists():
         backup_path = None
         try:
             with open(signals_csv, "r", encoding="utf-8-sig", newline="") as f:
@@ -227,11 +241,15 @@ def _append_to_csv(records: list[dict], strategy_id: str = "v1_wizard") -> None:
                     writer.writeheader()
                     for old in old_records:
                         reason = old.get("触发原因", "")
+                        direction = {
+                            "买入": "buy", "卖出": "sell", "观望": "watch",
+                        }.get(old.get("信号", ""), "buy")
                         new_row = {
                             "日期": old.get("日期", ""),
                             "股票": old.get("股票", ""),
                             "信号": old.get("信号", ""),
-                            "信号类型": old.get("信号类型") or V_EPS_V2_BUY_SIGNAL_TYPE,
+                            "信号类型": old.get("信号类型")
+                            or _default_signal_type(strategy_id, direction),
                             "强度(1-5)": old.get("强度(1-5)", ""),
                             "触发原因": reason,
                             "参考止损": old.get("参考止损", ""),

@@ -17,6 +17,7 @@ strategies/v_eps_v2/eps_v2_strategy.py — Weinstein Stage 2 + EPS 基本面过�
 """
 
 from events import SignalEvent
+from events.base import V_EPS_V2_BUY_SIGNAL_TYPE
 from strategies.v_weinstein.weinstein_strategy import WeinsteinStrategy, Position
 from data.fundamentals import check_eps_filter
 from data.rs import compute_rs
@@ -105,6 +106,8 @@ class EPSV2Strategy(WeinsteinStrategy):
             strength=signal.data["strength"], reason=reason, stop_loss=stop_loss,
             signal_price=close,  # NEW: close from line 78, for watchlist persistence
             rs_data=rs_data,
+            # 显式标注：main.py 靠 signal_type == "v_eps_v2_buy" 挑出主策略信号加进 watchlist
+            signal_type=V_EPS_V2_BUY_SIGNAL_TYPE,
         )
 
     def _compute_rs(self, symbol, date):
