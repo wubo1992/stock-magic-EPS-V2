@@ -72,10 +72,45 @@ class WeinsteinStrategy(StrategyBase):
         self.time_stop_days = self.cfg.get("time_stop_days", 30)
         self.time_stop_min_gain = self.cfg.get("time_stop_min_gain", 0.05)
 
+        # 退市/停牌过滤：行情落后基准超过 max_stale_bars 个交易日 → 不出信号
+        self.max_stale_bars = self.cfg.get("max_stale_bars", 3)
+        self.stale_symbols: list[str] = []      # 被跳过的代码
+        self.stale_details: list[tuple[str, str, int]] = []  # (代码, 最后K线日, 落后交易日数)
+
+    def _reference_index(self) -> pd.DatetimeIndex | None:
+        """基准（SPY）的 K 线索引 —— 用来数某只票落后了几个交易日。
+
+        没有基准时返回 None（此时不做落后过滤，避免误杀）。
+        """
+        spy = self.market_data.get("SPY")
+        if spy is None or len(spy) == 0:
+            return None
+        return spy.index
+
+    def _stale_bars_behind(self, df_to_date: pd.DataFrame, ref_index) -> int | None:
+        """落后基准多少个交易日。None = 无法判定（没有基准）。"""
+        if ref_index is None:
+            return None
+        if df_to_date is None or len(df_to_date) == 0:
+            return 10 ** 6
+        last = pd.Timestamp(df_to_date.index[-1])
+        if last.tzinfo is None:
+            last = last.tz_localize("UTC")
+        return int((ref_index > last).sum())
+
+    def _is_stale(self, df_to_date: pd.DataFrame, ref_index) -> bool:
+        lag = self._stale_bars_behind(df_to_date, ref_index)
+        return lag is not None and lag > self.max_stale_bars
+
     def run_date(self, date: datetime, queue: EventQueue) -> list[SignalEvent]:
         signals = []
+        self.stale_symbols = []
+        self.stale_details = []
+
+        ref_index = self._reference_index()
+
         if self.positions_enabled:
-            exit_signals = self._check_exits(date)
+            exit_signals = self._check_exits(date, ref_index=ref_index)
             for sig in exit_signals:
                 queue.put(sig)
                 signals.append(sig)
@@ -87,10 +122,31 @@ class WeinsteinStrategy(StrategyBase):
             min_rows = self.sma_long + self.pivot_lookback + 10
             if len(df_to_date) < min_rows:
                 continue
+            # 行情停更（退市/停牌）的票：最后一根 K 线不是最近的交易日，
+            # 用它算出来的形态不是「今天」的形态 → 跳过并记录
+            lag = self._stale_bars_behind(df_to_date, ref_index)
+            if lag is not None and lag > self.max_stale_bars:
+                self.stale_symbols.append(symbol)
+                self.stale_details.append(
+                    (symbol, str(pd.Timestamp(df_to_date.index[-1]).date()), lag)
+                )
+                continue
             signal = self._check_entry(symbol, df_to_date, date)
             if signal:
                 queue.put(signal)
                 signals.append(signal)
+
+        if self.stale_symbols:
+            shown = "、".join(
+                f"{s}(最后K线{d}, 落后{l}个交易日)"
+                for s, d, l in self.stale_details[:8]
+            )
+            tail = f" 等 {len(self.stale_symbols)} 只" if len(self.stale_symbols) > 8 else ""
+            print(
+                f"[数据滞后] 跳过 {len(self.stale_symbols)} 只行情停更的标的"
+                f"（退市/停牌/长期无成交）：{shown}{tail}"
+            )
+
 
         return signals
 
@@ -141,15 +197,20 @@ class WeinsteinStrategy(StrategyBase):
         )
         return signal
 
-    def _check_exits(self, date):
+    def _check_exits(self, date, ref_index=None):
         signals = []
         to_close = []
+        if ref_index is None:
+            ref_index = self._reference_index()
         for symbol, pos in self.positions.items():
             df = self.market_data.get(symbol)
             if df is None:
                 continue
             df_to_date = self._slice_to_date(df, date)
             if df_to_date.empty:
+                continue
+            # 行情停更的票：拿旧价格算止损 = 假出场信号
+            if self._is_stale(df_to_date, ref_index):
                 continue
             current_price = float(df_to_date["close"].iloc[-1])
             pos.days_held += 1

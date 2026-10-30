@@ -43,6 +43,10 @@ strategies:
     min_breakout_pct: 0.005
     volume_mult: 1.5
 
+    # 行情落后基准（SPY）超过这个交易日数 → 判定退市/停牌/长期无成交，跳过
+    # 不设的话会用几个月前的旧 K 线算出「今天」的买入信号
+    max_stale_bars: 3
+
     stop_loss_pct: 0.10
     trailing_stop_pct: 0.18
     time_stop_days: 30
@@ -61,6 +65,9 @@ strategies:
     pivot_lookback: 30
     min_breakout_pct: 0.005
     volume_mult: 1.5
+
+    # 行情落后基准（SPY）超过这个交易日数 → 判定退市/停牌/长期无成交，跳过
+    max_stale_bars: 3
 
     stop_loss_pct: 0.08
     trailing_stop_pct: 0.15
