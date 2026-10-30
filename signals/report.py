@@ -33,6 +33,19 @@ RS_RATING_BANDS = [
 ]
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """把 CSV 里读出来的值转成 int，取不到数字就退回默认值。
+
+    「强度(1-5)」这一列可能被挤歪：旧 schema 的 signals.csv（6/7 列）
+    遇上 12 列的行 → 按表头名字取值时，第 4 列（信号类型）会落到强度头上，
+    int('v_eps_v2_buy') 直接抛 ValueError，一份报告崩掉、一整天白跑。
+    """
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _rs_rating_band(rating: int) -> tuple[str, str]:
     """把 1-99 的 RS Rating 翻译成 (等级, 说明)。"""
     for threshold, label, note in RS_RATING_BANDS:
@@ -408,10 +421,14 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
     ]
 
     # ── 今日新增信号 ───────────────────────────────────────
-    today_buys  = [r for r in today_records if r.get("信号") == "买入"]
-    today_sells = [r for r in today_records if r.get("信号") == "卖出"]
+    # records 里混着 crossback pipeline 吐出的**全部历史 crossback**（自信号日以来累积），
+    # 不按日期过滤的话 2026-09-29 的信号会被标成「🆕 今日新增 / 明日开盘买入」。
+    # crossback 记录在报告末尾的「EMA 10 Crossback 信号」区段里另有完整展示。
+    today_only   = [r for r in today_records if r.get("日期") == today_str]
+    today_buys  = [r for r in today_only if r.get("信号") == "买入"]
+    today_sells = [r for r in today_only if r.get("信号") == "卖出"]
 
-    if not today_records:
+    if not today_only:
         lines += [
             "## 今日新增信号",
             "",
@@ -425,7 +442,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
                 "## 今日新增买入信号",
                 "",
             ]
-            for r in sorted(today_buys, key=lambda x: -int(x.get("强度(1-5)", 0))):
+            for r in sorted(today_buys, key=lambda x: -_safe_int(x.get("强度(1-5)", 0))):
                 lines += _format_signal_detail(r, is_today=True)
                 lines.append("")
 
@@ -471,7 +488,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
                 "|------|------|----|------|----------|----------|",
             ]
             for r in sorted(buys_7d, key=lambda x: x.get("日期", ""), reverse=True):
-                stars = "★" * int(r.get("强度(1-5)", 0))
+                stars = "★" * _safe_int(r.get("强度(1-5)", 0))
                 summary = _short_summary(r.get("触发原因", ""))
                 lines.append(
                     f"| {r['日期']} | **{r['股票']}** | {_rs_rating_str(r)} | {stars} "
@@ -534,7 +551,7 @@ def _format_signal_detail(r: dict, is_today: bool) -> list[str]:
     """生成单个买入信号的详细 Markdown 块。"""
     symbol   = r.get("股票", "?")
     date_str = r.get("日期", "?")
-    strength = int(r.get("强度(1-5)", 0))
+    strength = _safe_int(r.get("强度(1-5)", 0))
     stars    = "★" * strength + "☆" * (5 - strength)
     stop     = r.get("参考止损", "—")
     reason   = r.get("触发原因", "")

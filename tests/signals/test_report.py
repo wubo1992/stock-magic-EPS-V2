@@ -72,3 +72,54 @@ def test_generate_crossback_report(tmp_path):
     finally:
         if original is not None:
             report_mod.OUTPUT_DIR = original
+
+
+def test_build_report_today_section_excludes_older_crossback_records():
+    """「今日新增」区段只能放当天的信号。
+
+    main.py 把 v_eps_v2 当天信号 + crossback pipeline 吐出的**全部历史 crossback**
+    一起塞进 records（crossback 是「自信号日以来」累积的）。以前这里不按日期过滤，
+    于是 2026-09-29 的 crossback 也被标成「🆕 今日新增 / 明日开盘买入」。
+    """
+    from signals.report import _build_report
+
+    today_records = [
+        {
+            "日期": "2026-10-30", "股票": "DFIN", "信号": "买入",
+            "信号类型": "v_eps_v2_buy", "强度(1-5)": 3, "参考止损": "$55.95",
+            "触发原因": "[EPS] 最新季度EPS$1.44 | [量能] 4.4x均量",
+        },
+        {
+            "日期": "2026-09-29", "股票": "MGNI", "信号": "买入",
+            "信号类型": "crossback_buy", "强度(1-5)": 5, "参考止损": "$23.58",
+            "触发原因": "[EMA10回踩] 上穿EMA10($24.29, +5.7%)",
+        },
+    ]
+
+    content = _build_report(
+        "2026-10-30", today_records, [], strategy_name="Weinstein + EPS"
+    )
+
+    today_section = content.split("## 过去 7 天信号汇总")[0]
+    assert "DFIN" in today_section
+    assert "MGNI" not in today_section, "历史 crossback 不该出现在「今日新增」区段"
+    assert today_section.count("🆕 **今日新增**") == 1, "「今日新增」只能有一条"
+
+
+def test_build_report_today_section_says_no_signal_when_only_old_records():
+    """当天没信号但有历史 crossback 时，不该假装有今日新增。"""
+    from signals.report import _build_report
+
+    old_crossback = {
+        "日期": "2026-09-29", "股票": "MGNI", "信号": "买入",
+        "信号类型": "crossback_buy", "强度(1-5)": 5, "参考止损": "$23.58",
+        "触发原因": "[EMA10回踩] 上穿EMA10($24.29, +5.7%)",
+    }
+
+    content = _build_report(
+        "2026-10-30", [old_crossback], [], strategy_name="Weinstein + EPS"
+    )
+
+    today_section = content.split("## 过去 7 天信号汇总")[0]
+    assert "今日无新信号" in today_section
+    assert "MGNI" not in today_section
