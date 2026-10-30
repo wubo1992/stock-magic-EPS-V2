@@ -39,6 +39,11 @@ FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+# EPS 缓存过期时间（天）。EPS 每月只多一个季度，30 天足够；
+# 超过就必须重抓，否则永远看不到新季度（2026-10-30 实测：LUNG 的缓存
+# 从 2026-04-13 用到 10-29，最新季度还停在 2025-Q4）。
+EPS_CACHE_TTL_DAYS = 30
+
 
 def _eps_cache_path(symbol: str) -> Path:
     """EPS 缓存文件路径（永久缓存）"""
@@ -46,8 +51,15 @@ def _eps_cache_path(symbol: str) -> Path:
 
 
 def _is_cache_valid(path: Path) -> bool:
-    """检查缓存是否存在（历史 EPS 数据永久有效，不需要过期机制）"""
-    return path.exists()
+    """检查缓存是否存在且未过期。
+
+    历史季度数据本身永久有效；过期的只是「可能漏了新季度」这件事，
+    所以超过 TTL 就要重新抓一次。抓不到时调用方会回退到旧缓存。
+    """
+    if not path.exists():
+        return False
+    age_days = (time.time() - path.stat().st_mtime) / 86400
+    return age_days <= EPS_CACHE_TTL_DAYS
 
 
 def get_eps_growth(
@@ -89,15 +101,20 @@ def get_eps_growth(
 
     cache_path = _eps_cache_path(symbol)
 
-    # 尝试从缓存加载
-    if _is_cache_valid(cache_path):
+    # 尝试从缓存加载。缓存过期（>TTL）时先留一份旧数据当兜底，
+    # 刷新失败还能用 —— 宁可旧数据也不要没有数据。
+    stale_cache = None
+    if cache_path.exists():
         try:
             with open(cache_path, "rb") as f:
                 cached = pickle.load(f)
-            print(f"[EPS] {symbol} 从缓存加载")
-            return _check_eps_growth(
-                cached, quarters_required, yoy_required, qoq_required
-            )
+            if _is_cache_valid(cache_path):
+                print(f"[EPS] {symbol} 从缓存加载")
+                return _check_eps_growth(
+                    cached, quarters_required, yoy_required, qoq_required
+                )
+            stale_cache = cached
+            print(f"[EPS] {symbol} 缓存已过期（> {EPS_CACHE_TTL_DAYS} 天），尝试刷新...")
         except Exception as e:
             print(f"[EPS] {symbol} 缓存读取失败: {e}")
 
@@ -125,6 +142,11 @@ def get_eps_growth(
         print(f"[EPS] {symbol} 从 Alpha Vantage 获取数据...")
         eps_history = _fetch_eps_from_av(symbol)
         if not eps_history:
+            if stale_cache is not None:
+                print(f"[EPS] {symbol} 刷新失败，回退到过期缓存")
+                return _check_eps_growth(
+                    stale_cache, quarters_required, yoy_required, qoq_required
+                )
             return {
                 'has_data': False,
                 'quarters': 0,
@@ -146,6 +168,12 @@ def get_eps_growth(
             quarters_required,
             yoy_required,
             qoq_required
+        )
+
+    if stale_cache is not None:
+        print(f"[EPS] {symbol} 无可用 API，回退到过期缓存")
+        return _check_eps_growth(
+            stale_cache, quarters_required, yoy_required, qoq_required
         )
 
     return {
