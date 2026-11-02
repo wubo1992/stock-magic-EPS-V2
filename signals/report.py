@@ -23,6 +23,16 @@ OUTPUT_DIR = Path(__file__).parent.parent / "output"
 # ── 常量 ───────────────────────────────────────────────────
 RECENT_SIGNAL_DAYS = 10
 
+# 会算 RS Rating 的信号类型。只有这些类型缺 RS 值时，才可能是「老记录早于上线」；
+# 其他策略（v_weinstein / cigar_butt_v1a / cigar_butt_v1b）根本没接 RS Rating，
+# 缺值是常态，不能说成「早于上线」。
+_RS_RATED_SIGNAL_TYPES = {
+    "v_eps_v2_buy",
+    "v_eps_v2_sell",
+    "crossback_buy",
+    "crossback_sell",
+}
+
 # O'Neil RS Rating 判读标准（IBD 官方口径）
 RS_RATING_BANDS = [
     (90, "极强", "全市场前 10%，市场 leaders 级别"),
@@ -276,7 +286,8 @@ def generate_daily_report(
 
     # 生成报告内容
     content = _build_report(
-        today_str, today_records, history, strategy_name, rs_compute=rs_compute
+        today_str, today_records, history, strategy_name, rs_compute=rs_compute,
+        watchlist=watchlist,
     )
 
     # === Crossback 区段（spec §4.3） ===
@@ -399,7 +410,7 @@ def _build_crossback_section(crossback_records: list[dict], watchlist_status: di
 # 报告构建
 # ══════════════════════════════════════════════════════════
 
-def _build_report(today_str: str, today_records: list[dict], history: list[dict], strategy_name: str = "魔法师策略V1", rs_compute=None) -> str:
+def _build_report(today_str: str, today_records: list[dict], history: list[dict], strategy_name: str = "魔法师策略V1", rs_compute=None, watchlist: dict | None = None) -> str:
     lines = []
 
     # 历史信号的 RS 按当前口径重算：CSV 里写死的是「信号发出那天的池子」，
@@ -443,7 +454,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
                 "",
             ]
             for r in sorted(today_buys, key=lambda x: -_safe_int(x.get("强度(1-5)", 0))):
-                lines += _format_signal_detail(r, is_today=True)
+                lines += _format_signal_detail(r, is_today=True, watchlist=watchlist)
                 lines.append("")
 
         if today_sells:
@@ -521,7 +532,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
             "",
         ]
         for r in sorted(past_buys, key=lambda x: x.get("日期", ""), reverse=True):
-            lines += _format_signal_detail(r, is_today=False)
+            lines += _format_signal_detail(r, is_today=False, watchlist=watchlist)
             lines.append("")
 
     # ── 操作提醒 ────────────────────────────────────────────
@@ -547,7 +558,44 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
 # 单个信号详细格式化
 # ══════════════════════════════════════════════════════════
 
-def _format_signal_detail(r: dict, is_today: bool) -> list[str]:
+def _parse_price(value) -> float | None:
+    """把 "$61.17" / "61.17" / "—" 解析成 float，解析不了返回 None。"""
+    if value is None:
+        return None
+    s = str(value).strip().lstrip("$").replace(",", "")
+    if not s or s == "—":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _stop_loss_pct(record: dict, watchlist: dict | None) -> float | None:
+    """算出「参考止损相对买入价亏损百分之几」，拿不到就返回 None。
+
+    百分比必须算出来，不能写死：v_eps_v2 配的是 8%，v_weinstein 配的是 10%，
+    写死等于对用户说假话。而买入价只能从 watchlist 里拿（信号记录本身不存成交价），
+    拿不到就返回 None —— 宁可少说一句，也不能编一个数字出来。
+    """
+    if not watchlist:
+        return None
+    entry = watchlist.get(record.get("股票"))
+    if not entry:
+        return None
+    # watchlist 每个代码只存最近一次信号，日期对不上说明这条记录不是它的入场
+    if entry.get("signal_date") != record.get("日期"):
+        return None
+    price = entry.get("signal_price")
+    if not price or price <= 0:
+        return None
+    stop = _parse_price(record.get("参考止损"))
+    if stop is None or stop <= 0 or stop > price:
+        return None
+    return (1 - stop / price) * 100
+
+
+def _format_signal_detail(r: dict, is_today: bool, watchlist: dict | None = None) -> list[str]:
     """生成单个买入信号的详细 Markdown 块。"""
     symbol   = r.get("股票", "?")
     date_str = r.get("日期", "?")
@@ -560,6 +608,15 @@ def _format_signal_detail(r: dict, is_today: bool) -> list[str]:
     sections = _parse_reason(reason)
     rs_cols = _rs_columns(r)
     rs_rating = rs_cols.get("RS相对强度") or ""
+    if rs_rating:
+        rs_cell = rs_rating
+    elif (r.get("信号类型") or "") in _RS_RATED_SIGNAL_TYPES:
+        # 该策略本来就会算 RS Rating，缺值只可能是历史记录早于上线
+        rs_cell = "—（该记录早于 RS Rating 上线）"
+    else:
+        # v_weinstein / cigar_butt 等策略根本没接 RS Rating，
+        # 说成「早于上线」是在对用户说假话
+        rs_cell = "—（该策略未接入 RS Rating）"
 
     lines = [
         f"### {tag} — 买入 {symbol}　{stars}",
@@ -571,7 +628,7 @@ def _format_signal_detail(r: dict, is_today: bool) -> list[str]:
         f"| 信号日期 | {date_str} |",
         f"| 信号方向 | 买入 |",
         f"| 信号强度 | {stars}（{strength}/5） |",
-        f"| RS 相对强度 | {rs_rating if rs_rating else '—（该记录早于 RS Rating 上线）'} |",
+        f"| RS 相对强度 | {rs_cell} |",
         f"| 参考止损 | {stop} |",
         f"| 建议操作 | {'明日开盘买入' if is_today else date_str + ' 次日已可执行'} |",
         "",
@@ -677,7 +734,22 @@ def _format_signal_detail(r: dict, is_today: bool) -> list[str]:
     # ── 风险提示 ──────────────────────────────────────────
     lines += [
         "> **风险提示**：以上均为系统自动识别的技术信号，不构成投资建议。",
-        f"> 参考止损 {stop} 对应从买入价亏损约 10%，务必在买入后立即设置止损单。",
+    ]
+    if stop and stop != "—":
+        pct = _stop_loss_pct(r, watchlist)
+        if pct is not None:
+            lines.append(
+                f"> 参考止损 {stop} 对应从买入价亏损约 {pct:.0f}%，务必在买入后立即设置止损单。"
+            )
+        else:
+            # 拿不到买入价就不写百分比 —— 编一个数出来比不说更糟
+            lines.append(
+                f"> 参考止损 {stop}，务必在买入后立即设置止损单。"
+            )
+    else:
+        # 没有止损价时不能凭空说「亏损约 10%」—— 那是编的数字
+        lines.append("> 该信号没有给出参考止损价，入场前请自行设定止损。")
+    lines += [
         "",
         "---",
     ]
@@ -960,11 +1032,12 @@ def generate_crossback_report(
     lines.append("")
 
     # 今日无触发时，展示过去 10 天信号收益追踪
+    # 区段永远保留：窗口内没信号就写「过去 10 天无触发信号」，
+    # 整段消失会让人分不清是「没触发」还是「报告坏了」
     if not today_triggered:
         if recent_pnl is None and cache_dir is not None:
             recent_pnl = compute_recent_signal_pnl(watchlist, today, cache_dir)
-        if recent_pnl:
-            lines += _build_recent_pnl_section(recent_pnl)
+        lines += _build_recent_pnl_section(recent_pnl or [])
 
     if watchlist:
         lines.append("### 监控明细")
