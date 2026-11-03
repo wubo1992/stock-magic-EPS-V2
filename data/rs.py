@@ -622,6 +622,43 @@ def _price_span_absurd(closes: pd.Series, window: int = MIN_HISTORY_DAYS) -> boo
     return bool(win.max() / lo > _rsu.MAX_PRICE_SPAN)
 
 
+def rs_unavailable_reason(
+    df: pd.DataFrame | None,
+    as_of_date: str | datetime,
+    ticker: str = "",
+) -> str:
+    """说明这只票为什么算不出 RS Rating —— 报告要如实告诉用户原因。
+
+    `compute_rs` 失败时只返回 None，调用方（报告）只能显示一个光秃秃的「—」。
+    用户看到「—」根本不知道是「这票太新算不出」还是「数据坏了」，
+    所以这里把同一套判据复述一遍，换成一句人话。
+
+    返回空字符串 = 原因不明（数据缺失等）。**不猜**：宁可说「原因不明」，
+    也不编一个听起来合理的原因。
+    """
+    if df is None or df.empty:
+        return ""
+
+    as_of = _normalize_date(as_of_date)
+    closes = _deduplicate_bars(_slice_to_date(df, as_of))
+    n = len(closes)
+    if n == 0:
+        return ""
+
+    # 顺序与 _compute_weighted_return 的判据一致：先说最常见的「历史不够」
+    if n < MIN_HISTORY_DAYS:
+        # 只说「可用历史不够」，不说「上市晚」—— 数据源从哪天开始有 bar
+        # 未必等于上市日（换代码、补数据都会造成这种缺口），不能替用户下结论
+        return f"可用历史不足 {MIN_HISTORY_DAYS} 个交易日（截至信号日仅 {n} 根）"
+    if ticker and _break_inside_window(ticker, closes, MIN_HISTORY_DAYS):
+        return "窗口跨越已知历史断点（重组/合并）"
+    if _price_span_absurd(closes):
+        return "窗口内价格量级异常"
+    if _window_span_days(closes, MIN_HISTORY_DAYS) > _rsu.MAX_WINDOW_SPAN_DAYS:
+        return "窗口内有大空洞，历史不连续"
+    return ""
+
+
 def _usable_price(value: float) -> bool:
     """
     收盘价能否参与收益计算：必须是有限的正数。

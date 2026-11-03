@@ -14,10 +14,16 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from data.rs import RS_COLUMN_NAMES, compute_rs, parse_rs_columns_from_reason
+from data.rs import (
+    RS_COLUMN_NAMES,
+    compute_rs,
+    parse_rs_columns_from_reason,
+    rs_unavailable_reason,
+)
 
 # ── 路径 ───────────────────────────────────────────────────
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
+DEFAULT_CACHE_DIR = Path("data/cache")
 
 
 # ── 常量 ───────────────────────────────────────────────────
@@ -32,6 +38,18 @@ _RS_RATED_SIGNAL_TYPES = {
     "crossback_buy",
     "crossback_sell",
 }
+
+# RS Rating 上线日。
+#
+# 判据：signals.csv 里**第一条**在「触发原因」中带 RS-Rating= 的信号日期。
+# 在那之前 RS Rating 根本没有在信号链路里实时计算过 —— 那些老记录里的
+# RS Rating 是 2026-10-29 事后回填的（见 commit 36f6e6e）。
+#
+# 这个日期必须区分清楚：上线之后出的信号如果缺 RS Rating，原因是**算不出来**
+# （上市不够久 / 数据脏），跟「上线早晚」毫无关系。
+# 现场（2026-11-03）：CBC 当天出信号，RS 因上市不足 253 个交易日而算不出，
+# 报告却写成「该记录早于 RS Rating 上线」—— 对着今天的信号讲历史，说不过去。
+_RS_RATING_LAUNCH_DATE = "2026-09-14"
 
 # O'Neil RS Rating 判读标准（IBD 官方口径）
 RS_RATING_BANDS = [
@@ -79,6 +97,45 @@ def _rs_columns(record: dict) -> dict[str, str]:
 def _rs_rating_str(record: dict) -> str:
     """RS Rating 的表格展示值（缺失时显示 —）。"""
     return _rs_columns(record).get("RS相对强度") or "—"
+
+
+def _rs_rating_missing_note(record: dict) -> str:
+    """RS Rating 缺失时的一句话说明 —— 必须是真话。
+
+    三种情况，三种说法：
+      - 该策略根本没接 RS Rating（v_weinstein / cigar_butt 等）
+      - 记录早于 RS Rating 上线（上线前的老记录，缺值属正常）
+      - 上线之后算不出来（历史不够 / 数据脏）—— 跟上线早晚无关
+    """
+    if (record.get("信号类型") or "") not in _RS_RATED_SIGNAL_TYPES:
+        return "该策略未接入 RS Rating"
+    if (record.get("日期") or "") < _RS_RATING_LAUNCH_DATE:
+        return "该记录早于 RS Rating 上线"
+    return "该信号未能计算 RS Rating"
+
+
+def _rs_missing_cell(record: dict, cache_dir=None) -> str:
+    """RS Rating 缺失时，表格单元格里显示什么。
+
+    算不出来时要**说清原因**（上市才 100 个交易日 / 数据异常），
+    不能只给一个「—」，更不能编一句「早于上线」来搪塞。
+    """
+    note = _rs_rating_missing_note(record)
+    symbol = (record.get("股票") or "").strip()
+    date_str = (record.get("日期") or "").strip()
+
+    reason = ""
+    if symbol and date_str:
+        df = _load_cached_df(symbol, cache_dir or DEFAULT_CACHE_DIR)
+        if df is not None:
+            try:
+                reason = rs_unavailable_reason(df, date_str, ticker=symbol)
+            except Exception:
+                reason = ""
+
+    if reason:
+        return f"—（{note}：{reason}）"
+    return f"—（{note}）"
 
 
 # ══════════════════════════════════════════════════════════
@@ -256,6 +313,7 @@ def generate_daily_report(
     watchlist_status: dict | None = None,
     watchlist: dict | None = None,
     rs_compute=None,
+    cache_dir=None,
 ) -> Path:
     """
     生成今日报告，保存到 output/{strategy_id}/YYYY-MM-DD/报告_{strategy_name}_YYYY-MM-DD.md。
@@ -269,6 +327,8 @@ def generate_daily_report(
         watchlist:        watchlist 完整字典（可选）。非空时附加"Watchlist EMA10 Crossback 状态"段落。
         rs_compute:      (symbol, date) -> RSResult|None，用于把历史信号的 RS
                          按当前口径重算（见 refresh_history_rs）。None = 不重算。
+        cache_dir:       行情缓存目录，用于在 RS 算不出来时说明原因
+                         （见 _rs_missing_cell）。None = data/cache。
 
     返回：
         报告文件的 Path
@@ -287,7 +347,7 @@ def generate_daily_report(
     # 生成报告内容
     content = _build_report(
         today_str, today_records, history, strategy_name, rs_compute=rs_compute,
-        watchlist=watchlist,
+        watchlist=watchlist, cache_dir=cache_dir,
     )
 
     # === Crossback 区段（spec §4.3） ===
@@ -410,7 +470,7 @@ def _build_crossback_section(crossback_records: list[dict], watchlist_status: di
 # 报告构建
 # ══════════════════════════════════════════════════════════
 
-def _build_report(today_str: str, today_records: list[dict], history: list[dict], strategy_name: str = "魔法师策略V1", rs_compute=None, watchlist: dict | None = None) -> str:
+def _build_report(today_str: str, today_records: list[dict], history: list[dict], strategy_name: str = "魔法师策略V1", rs_compute=None, watchlist: dict | None = None, cache_dir=None) -> str:
     lines = []
 
     # 历史信号的 RS 按当前口径重算：CSV 里写死的是「信号发出那天的池子」，
@@ -454,7 +514,8 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
                 "",
             ]
             for r in sorted(today_buys, key=lambda x: -_safe_int(x.get("强度(1-5)", 0))):
-                lines += _format_signal_detail(r, is_today=True, watchlist=watchlist)
+                lines += _format_signal_detail(r, is_today=True, watchlist=watchlist,
+                                              cache_dir=cache_dir)
                 lines.append("")
 
         if today_sells:
@@ -532,7 +593,8 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
             "",
         ]
         for r in sorted(past_buys, key=lambda x: x.get("日期", ""), reverse=True):
-            lines += _format_signal_detail(r, is_today=False, watchlist=watchlist)
+            lines += _format_signal_detail(r, is_today=False, watchlist=watchlist,
+                                          cache_dir=cache_dir)
             lines.append("")
 
     # ── 操作提醒 ────────────────────────────────────────────
@@ -595,7 +657,8 @@ def _stop_loss_pct(record: dict, watchlist: dict | None) -> float | None:
     return (1 - stop / price) * 100
 
 
-def _format_signal_detail(r: dict, is_today: bool, watchlist: dict | None = None) -> list[str]:
+def _format_signal_detail(r: dict, is_today: bool, watchlist: dict | None = None,
+                          cache_dir=None) -> list[str]:
     """生成单个买入信号的详细 Markdown 块。"""
     symbol   = r.get("股票", "?")
     date_str = r.get("日期", "?")
@@ -610,13 +673,10 @@ def _format_signal_detail(r: dict, is_today: bool, watchlist: dict | None = None
     rs_rating = rs_cols.get("RS相对强度") or ""
     if rs_rating:
         rs_cell = rs_rating
-    elif (r.get("信号类型") or "") in _RS_RATED_SIGNAL_TYPES:
-        # 该策略本来就会算 RS Rating，缺值只可能是历史记录早于上线
-        rs_cell = "—（该记录早于 RS Rating 上线）"
     else:
-        # v_weinstein / cigar_butt 等策略根本没接 RS Rating，
-        # 说成「早于上线」是在对用户说假话
-        rs_cell = "—（该策略未接入 RS Rating）"
+        # 缺值有三种原因（策略没接 / 早于上线 / 算不出来），必须分开说，
+        # 更不能编一个「早于上线」来搪塞今天的信号
+        rs_cell = _rs_missing_cell(r, cache_dir)
 
     lines = [
         f"### {tag} — 买入 {symbol}　{stars}",
@@ -689,7 +749,7 @@ def _format_signal_detail(r: dict, is_today: bool, watchlist: dict | None = None
             label, note = _rs_rating_band(rating_int)
             lines.append(f"- **O'Neil RS Rating = {rating_int} / 99**（{label}）— {note}")
         else:
-            lines.append("- **O'Neil RS Rating = —**：该记录生成时尚未启用 RS Rating，只有 RS/SPY 相对强度")
+            lines.append(f"- **O'Neil RS Rating = —**：{_rs_rating_missing_note(r)}")
 
         lines.append("- RS/SPY = 1.0 为大盘基准，>1 表示跑赢大盘，<1 表示弱于大盘")
         lines.append("- RS 越高说明这只股票比市场上大多数股票都更强，是市场领涨者")

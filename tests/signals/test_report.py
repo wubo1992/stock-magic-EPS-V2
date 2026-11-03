@@ -249,3 +249,87 @@ def test_stop_loss_percentage_is_omitted_when_entry_price_is_unknown():
 
     assert "对应从买入价亏损约" not in content
     assert "参考止损 $61.17" in content
+
+
+def _write_fake_pkl(path, n_bars: int, end: str = "2026-11-02"):
+    """造一份日线 pkl（多根同日的重复时间戳也要能扛住）。"""
+    import pandas as pd
+
+    dates = pd.date_range(end=end, periods=n_bars, freq="B", tz="UTC")
+    df = pd.DataFrame(
+        {"open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5, "volume": 1000},
+        index=dates,
+    )
+    df.to_pickle(path)
+
+
+def test_rs_missing_on_a_post_launch_signal_is_not_blamed_on_the_rs_launch(tmp_path):
+    """上线之后才出的信号，缺 RS 不能说成「早于 RS Rating 上线」。
+
+    现场（2026-11-03）：CBC 当天出信号，RS 算不出来（上市才 238 个交易日），
+    报告却写「—（该记录早于 RS Rating 上线）」。CBC 是**今天**才出的信号，
+    跟上线早晚毫无关系 —— 写错了就是在对用户说假话。
+    """
+    from signals.report import _build_report
+
+    _write_fake_pkl(tmp_path / "NEWCO.pkl", 300)
+
+    record = {
+        "日期": "2026-11-03", "股票": "NEWCO", "信号": "买入",
+        "信号类型": "v_eps_v2_buy", "强度(1-5)": 3, "参考止损": "$9.66",
+        "触发原因": "[EPS] 最新季度EPS$0.48 | [量能] 1.9x均量",
+    }
+
+    content = _build_report(
+        "2026-11-03", [record], [], strategy_name="Weinstein + EPS",
+        cache_dir=tmp_path,
+    )
+
+    assert "该记录早于 RS Rating 上线" not in content
+    assert "未能计算 RS Rating" in content
+
+
+def test_rs_missing_reason_names_insufficient_history(tmp_path):
+    """RS 算不出来时要说清原因 —— 可用历史不足 253 个交易日就该这么写。
+
+    注意措辞：只能说「可用历史不足」，不能断言「上市晚」—— 数据源从哪天有 bar
+    未必等于上市日（换代码、补数据都会造成缺口）。
+    """
+    from signals.report import _build_report
+
+    _write_fake_pkl(tmp_path / "NEWCO.pkl", 100)
+
+    record = {
+        "日期": "2026-11-03", "股票": "NEWCO", "信号": "买入",
+        "信号类型": "v_eps_v2_buy", "强度(1-5)": 3, "参考止损": "$9.66",
+        "触发原因": "[EPS] 最新季度EPS$0.48 | [量能] 1.9x均量",
+    }
+
+    content = _build_report(
+        "2026-11-03", [record], [], strategy_name="Weinstein + EPS",
+        cache_dir=tmp_path,
+    )
+
+    assert "可用历史不足 253 个交易日" in content
+    assert "仅 100 根" in content
+    assert "上市不足" not in content
+
+
+def test_rs_missing_on_a_pre_launch_record_still_blames_the_launch(tmp_path):
+    """上线之前的老记录，缺 RS 属正常 —— 说法不能改。"""
+    from signals.report import _build_report
+
+    _write_fake_pkl(tmp_path / "OLDCO.pkl", 300, end="2026-08-20")
+
+    record = {
+        "日期": "2026-08-25", "股票": "OLDCO", "信号": "买入",
+        "信号类型": "v_eps_v2_buy", "强度(1-5)": 3, "参考止损": "$9.66",
+        "触发原因": "[EPS] 最新季度EPS$0.48 | [量能] 1.9x均量",
+    }
+
+    content = _build_report(
+        "2026-08-25", [record], [], strategy_name="Weinstein + EPS",
+        cache_dir=tmp_path,
+    )
+
+    assert "该记录早于 RS Rating 上线" in content
