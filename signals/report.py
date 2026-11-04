@@ -119,8 +119,15 @@ def _rs_missing_cell(record: dict, cache_dir=None) -> str:
 
     算不出来时要**说清原因**（上市才 100 个交易日 / 数据异常），
     不能只给一个「—」，更不能编一句「早于上线」来搪塞。
+
+    但策略**根本没接 RS** 时就到此为止 —— 再补一句「历史不足 N 个交易日」
+    是在解释一个不存在的问题（现场 2026-11-04：v_weinstein 的报告里出现过
+    「该策略未接入 RS Rating：可用历史不足 253 个交易日」，自相矛盾）。
     """
     note = _rs_rating_missing_note(record)
+    if note == "该策略未接入 RS Rating":
+        return f"—（{note}）"
+
     symbol = (record.get("股票") or "").strip()
     date_str = (record.get("日期") or "").strip()
 
@@ -314,6 +321,7 @@ def generate_daily_report(
     watchlist: dict | None = None,
     rs_compute=None,
     cache_dir=None,
+    today: datetime | None = None,
 ) -> Path:
     """
     生成今日报告，保存到 output/{strategy_id}/YYYY-MM-DD/报告_{strategy_name}_YYYY-MM-DD.md。
@@ -329,11 +337,13 @@ def generate_daily_report(
                          按当前口径重算（见 refresh_history_rs）。None = 不重算。
         cache_dir:       行情缓存目录，用于在 RS 算不出来时说明原因
                          （见 _rs_missing_cell）。None = data/cache。
+        today:           报告对应的日期。None = UTC 当天。传历史日期可**重生成**
+                         旧报告（例如代码修好后刷新已生成过的那一份）。
 
     返回：
         报告文件的 Path
     """
-    today = datetime.now(tz=timezone.utc)
+    today = today or datetime.now(tz=timezone.utc)
     today_str = today.strftime("%Y-%m-%d")
 
     # 创建输出目录
@@ -342,7 +352,7 @@ def generate_daily_report(
     report_path = day_dir / f"报告_{strategy_name}_{today_str}.md"
 
     # 读取过去 7 天的历史信号（从该策略专属 CSV）
-    history = _read_recent_signals(strategy_id=strategy_id, days=7)
+    history = _read_recent_signals(strategy_id=strategy_id, days=7, today=today)
 
     # 生成报告内容
     content = _build_report(
@@ -483,7 +493,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
         f"# {strategy_name} 信号日报 — {today_str}",
         "",
         f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
-        f"> 报告范围：过去 7 天（{_days_ago(7)} 至 {today_str}）  ",
+        f"> 报告范围：过去 7 天（{_days_ago(7, base=today_str)} 至 {today_str}）  ",
         f"> 策略：{strategy_name}  ",
         "> 提示：信号日期为策略检测到条件的当天，**建议次日开盘执行**",
         "",
@@ -948,20 +958,31 @@ def _interpret_breakout(breakout: str) -> list[str]:
 # 工具函数
 # ══════════════════════════════════════════════════════════
 
-def _read_recent_signals(strategy_id: str = "v1_wizard", days: int = 7) -> list[dict]:
-    """从策略专属 signals.csv 读取最近 N 天的信号记录。days=0 表示仅用于计数。"""
+def _read_recent_signals(
+    strategy_id: str = "v1_wizard",
+    days: int = 7,
+    today: datetime | None = None,
+) -> list[dict]:
+    """从策略专属 signals.csv 读取最近 N 天的信号记录。days=0 表示仅用于计数。
+
+    today 用于锚定「最近」的基准日 —— 重生成历史报告时，窗口要跟着历史日期走，
+    不能拿今天当基准（否则会读到历史日期之后的信号）。
+    """
     signals_csv = OUTPUT_DIR / strategy_id / "signals.csv"
     if not signals_csv.exists():
         return []
 
-    cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    base = today or datetime.now(tz=timezone.utc)
+    cutoff = (base - timedelta(days=days)).strftime("%Y-%m-%d")
+    base_str = base.strftime("%Y-%m-%d")
     records = []
 
     with open(signals_csv, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             date_str = row.get("日期", "")
-            if days == 0 or date_str >= cutoff:
+            # 上界也卡住：重生成历史报告时，不能把基准日之后的信号算进「过去 7 天」
+            if days == 0 or (cutoff <= date_str <= base_str):
                 records.append(dict(row))
 
     # 去重：同一天同一股票同一方向只保留最后一条
@@ -1004,8 +1025,13 @@ def _short_summary(reason: str) -> str:
     return " | ".join(parts) if parts else reason[:40]
 
 
-def _days_ago(n: int) -> str:
-    return (datetime.now(tz=timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
+def _days_ago(n: int, base: str | None = None) -> str:
+    """n 天前的日期。base = 'YYYY-MM-DD' 时以该日为基准（重生成历史报告用）。"""
+    if base:
+        base_dt = datetime.strptime(base, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        base_dt = datetime.now(tz=timezone.utc)
+    return (base_dt - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
 # ══════════════════════════════════════════════════════════

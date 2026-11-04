@@ -23,6 +23,89 @@ def test_parse_reason_still_extracts_other_tokens():
     assert "[RS]" in sections
 
 
+def test_generate_daily_report_can_target_a_past_date(tmp_path):
+    """历史报告要能按指定日期重生成。
+
+    现场（2026-11-04）：修好了「RS 算不出来」的说法，但 11-03 那份报告已经
+    生成过了，代码再对也不会自己变 —— 没有按日期重生成的入口，修正就落不了地。
+    """
+    from pathlib import Path
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        path = report_mod.generate_daily_report(
+            [],
+            strategy_id="v_eps_v2",
+            strategy_name="Weinstein + EPS",
+            today=datetime(2026, 11, 3, tzinfo=timezone.utc),
+        )
+        assert Path(path).parent.name == "2026-11-03"
+        assert Path(path).name == "报告_Weinstein + EPS_2026-11-03.md"
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+
+def test_generate_daily_report_defaults_to_today(tmp_path):
+    """不传 today 时行为不变 —— 仍然写到当天目录。"""
+    from pathlib import Path
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        path = report_mod.generate_daily_report(
+            [], strategy_id="v_eps_v2", strategy_name="Weinstein + EPS",
+        )
+        expected = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        assert Path(path).parent.name == expected
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+
+def test_read_recent_signals_excludes_records_after_the_base_date(tmp_path):
+    """重生成历史报告时，基准日之后的信号不能混进「过去 7 天」。
+
+    11-04 重生成 11-03 的报告时，CSV 里已经有 11-04 的行（虽然今天 0 信号，
+    但只要将来有，就会把「未来」的信号写进历史报告）。
+    """
+    import csv
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+
+    strategy_dir = tmp_path / "v_eps_v2"
+    strategy_dir.mkdir(parents=True)
+    with open(strategy_dir / "signals.csv", "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(
+            f, fieldnames=["日期", "股票", "信号", "信号类型", "强度(1-5)",
+                           "触发原因", "参考止损"]
+        )
+        w.writeheader()
+        w.writerow({"日期": "2026-11-02", "股票": "OLD", "信号": "买入",
+                    "信号类型": "v_eps_v2_buy", "强度(1-5)": 3,
+                    "触发原因": "", "参考止损": "$1"})
+        w.writerow({"日期": "2026-11-04", "股票": "FUTURE", "信号": "买入",
+                    "信号类型": "v_eps_v2_buy", "强度(1-5)": 3,
+                    "触发原因": "", "参考止损": "$1"})
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        records = report_mod._read_recent_signals(
+            strategy_id="v_eps_v2", days=7,
+            today=datetime(2026, 11, 3, tzinfo=timezone.utc),
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+    symbols = {r["股票"] for r in records}
+    assert "OLD" in symbols
+    assert "FUTURE" not in symbols
+
+
 def test_generate_crossback_report(tmp_path):
     """generate_crossback_report should create a markdown file at the expected path."""
     from pathlib import Path
@@ -146,6 +229,34 @@ def test_missing_rs_rating_message_matches_the_strategy():
 
     assert "该记录早于 RS Rating 上线" not in content
     assert "未接入 RS" in content
+
+
+def test_strategy_without_rs_gets_no_history_explanation(tmp_path):
+    """策略压根不接 RS 时，不该再解释「历史不足多少根」。
+
+    现场（2026-11-04，重生成 v_weinstein 10-30 报告时发现）：
+    写成「—（该策略未接入 RS Rating：可用历史不足 253 个交易日）」——
+    一边说没接 RS，一边解释为什么算不出 RS，前后矛盾，而且解释的是
+    一个根本不存在的问题。
+    """
+    from signals.report import _build_report
+
+    _write_fake_pkl(tmp_path / "NEWCO.pkl", 100)
+
+    weinstein_today = {
+        "日期": "2026-10-30", "股票": "NEWCO", "信号": "买入",
+        "信号类型": "v_weinstein_buy", "强度(1-5)": 3, "参考止损": "$12.72",
+        "触发原因": "[Stage2] SMA150上升30天",
+    }
+
+    content = _build_report(
+        "2026-10-30", [weinstein_today], [], strategy_name="Weinstein Stage 2",
+        cache_dir=tmp_path,
+    )
+
+    assert "该策略未接入 RS Rating）" in content
+    assert "可用历史不足" not in content
+    assert "个交易日" not in content
 
 
 def test_missing_stop_loss_does_not_claim_a_ten_percent_loss():
