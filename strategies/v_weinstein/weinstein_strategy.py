@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from data.daily_bars import dedup_daily_bars
 from events import EventQueue, SignalEvent
 from strategies.base import StrategyBase
 
@@ -78,14 +79,17 @@ class WeinsteinStrategy(StrategyBase):
         self.stale_details: list[tuple[str, str, int]] = []  # (代码, 最后K线日, 落后交易日数)
 
     def _reference_index(self) -> pd.DatetimeIndex | None:
-        """基准（SPY）的 K 线索引 —— 用来数某只票落后了几个交易日。
+        """基准（SPY）的交易日索引 —— 用来数某只票落后了几个交易日。
+
+        SPY 的 pkl 里同一天可能有两根 bar，必须先去重再归一化到 00:00，
+        否则「落后 1 天」会被数成「落后 2 根 bar」。
 
         没有基准时返回 None（此时不做落后过滤，避免误杀）。
         """
         spy = self.market_data.get("SPY")
         if spy is None or len(spy) == 0:
             return None
-        return spy.index
+        return dedup_daily_bars(spy).index.normalize()
 
     def _stale_bars_behind(self, df_to_date: pd.DataFrame, ref_index) -> int | None:
         """落后基准多少个交易日。None = 无法判定（没有基准）。"""
@@ -96,7 +100,7 @@ class WeinsteinStrategy(StrategyBase):
         last = pd.Timestamp(df_to_date.index[-1])
         if last.tzinfo is None:
             last = last.tz_localize("UTC")
-        return int((ref_index > last).sum())
+        return int((ref_index > last.normalize()).sum())
 
     def _is_stale(self, df_to_date: pd.DataFrame, ref_index) -> bool:
         lag = self._stale_bars_behind(df_to_date, ref_index)
@@ -119,6 +123,8 @@ class WeinsteinStrategy(StrategyBase):
             if symbol in ("SPY", "^VIX"):
                 continue
             df_to_date = self._slice_to_date(df, date)
+            # 同一天可能有「合并量 bar + IEX bar」两根 → 窗口必须按**交易日**算，不能按行数算
+            df_to_date = dedup_daily_bars(df_to_date)
             min_rows = self.sma_long + self.pivot_lookback + 10
             if len(df_to_date) < min_rows:
                 continue
@@ -160,11 +166,12 @@ class WeinsteinStrategy(StrategyBase):
         sma_past = float(sma150.iloc[-self.trend_lookback])
 
         # Stage 2 确认：SMA150 当前值 > trend_lookback 天前的值
-        if sma_now <= sma_past:
+        # 用 `>` 而不是 `<=`：NaN 参与比较恒为 False，写成 `<=` 会让 SMA 算不出的票蒙混过关
+        if not sma_now > sma_past:
             return None
 
         # 2. 价格必须在 SMA150 之上
-        if current <= sma_now:
+        if not current > sma_now:
             return None
 
         # 3. 突破近期整理区最高价（排除今天）
@@ -173,8 +180,6 @@ class WeinsteinStrategy(StrategyBase):
             return None
 
         # 4. 放量确认（成交量 >= volume_mult × 20 日均量）
-        avg_vol = float(close_series.iloc[-21:-1].mean())  # 等等，这里用的是 close_series 而不是 volume
-        # 原文用的是 df["volume"]
         avg_vol = float(df["volume"].iloc[-21:-1].mean())
         if avg_vol == 0:
             return None

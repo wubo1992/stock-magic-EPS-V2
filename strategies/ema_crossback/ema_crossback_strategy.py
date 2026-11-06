@@ -21,6 +21,7 @@ from typing import Any
 
 import pandas as pd
 
+from data.daily_bars import dedup_daily_bars
 from data.fetcher import fetch
 from data.rs import compute_rs
 from events import SignalEvent
@@ -48,6 +49,11 @@ def detect_crossback(
         失败/数据不足时返回 []
     """
     if df is None or len(df) < ema_period + vol_lookback:
+        return []
+
+    # 同一天可能有「合并量 bar + IEX bar」两根 → 窗口必须按**交易日**算，不能按行数算
+    df = dedup_daily_bars(df)
+    if len(df) < ema_period + vol_lookback:
         return []
 
     df = df.copy()
