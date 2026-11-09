@@ -229,3 +229,5 @@ def test_cli_prints_paste_block(env, capsys):
     assert "注意" in out, f"没打印注意事项：\n{out}"
     assert "大盘" in out, f"没打印大盘：\n{out}"
     assert "TEST" in out, f"信号表里没有当日信号：\n{out}"
+    # 量比 ≥2x 必须带 ⚡ —— 与 md 段 1 的标记口径一致
+    assert "2.0x ⚡" in out, f"放量没标 ⚡：\n{out}"

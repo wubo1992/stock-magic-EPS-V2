@@ -1327,7 +1327,7 @@ def build_paste_block(data: ReportData) -> str:
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for v in data.today_main:
         p = v.parsed
-        ratio = f"{v.metrics.vol_ratio:.1f}x" if v.metrics and v.metrics.vol_ratio else "—"
+        ratio = _vol_cell(v, recompute=True, bold=False)
         lines.append(
             f"| **{v.symbol}** | {_stars(v.strength)} | {_money(v.stop)} | {_money(p.get('eps'))} | "
             f"{p.get('yoy') or '—'} | {p.get('qoq') or '—'} | {ratio} | "
