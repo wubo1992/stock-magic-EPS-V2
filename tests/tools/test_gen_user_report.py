@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.gen_user_report import build_user_report  # noqa: E402
+from tools.gen_user_report import build_user_report, main  # noqa: E402
 
 SIGNAL_DATE = "2026-11-06"
 CSV_HEADER = [
@@ -207,3 +207,25 @@ def test_missing_cache_symbol_does_not_crash(env):
         cache_dir=env["cache_dir"], universe_path=env["universe"],
     )
     assert "DEAD" in md  # 有缓存的 DEAD 进表；无缓存的走缺失分支也不崩
+
+
+def test_cli_prints_paste_block(env, capsys):
+    """CLI 必须把「信号表 / 三条建议 / 大盘一行」直接打到 stdout。
+
+    这是「每天只贴三样」承诺的落点 —— 只写 md 文件等于还要人工再抄一遍。
+    """
+    rc = main([
+        "--date", env["date"],
+        "--signals", str(env["signals_csv"]),
+        "--watchlist", str(env["watchlist"]),
+        "--cache-dir", str(env["cache_dir"]),
+        "--universe", str(env["universe"]),
+        "--out-dir", str(env["cache_dir"].parent / "out"),
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "信号表（今日" in out, f"没打印信号表：\n{out}"
+    assert "最强组合" in out, f"没打印最强组合：\n{out}"
+    assert "注意" in out, f"没打印注意事项：\n{out}"
+    assert "大盘" in out, f"没打印大盘：\n{out}"
+    assert "TEST" in out, f"信号表里没有当日信号：\n{out}"

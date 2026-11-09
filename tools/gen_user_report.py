@@ -1379,6 +1379,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--universe", default=str(defaults["universe_path"]))
     parser.add_argument("--out-dir", default=str(defaults["out_dir"]))
     parser.add_argument("--days-back", type=int, default=7)
+    parser.add_argument("--quiet", action="store_true", help="不打印可贴片段落")
     args = parser.parse_args(argv)
 
     date_str = args.date
@@ -1394,6 +1395,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"✅ 已写出：{out_file}")
     print(f"   今日主策略 {len(data.today_main)} 个 / 回踩 {len(data.today_cross)} 个 / "
           f"监控池 {len(data.watch)} 只")
+    if not args.quiet:
+        # 每天只贴三样 —— 直接打印，字段说明/caveat/监控池明细留在 md 里
+        print()
+        print(build_paste_block(data))
     return 0
 
 
