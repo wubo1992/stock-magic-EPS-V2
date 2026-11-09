@@ -160,7 +160,10 @@ def test_report_renders_a_legacy_strategy_csv_without_crashing(tmp_path, monkeyp
     )]
 
     report_path = report_module.generate_daily_report(
-        records, strategy_id="v_weinstein", strategy_name="Weinstein"
+        records, strategy_id="v_weinstein", strategy_name="Weinstein",
+        # 显式指定报告日 = 信号日。写死「今天」会让本测试随日历腐烂
+        # （信号日期 2026-10-30 一旦滑出「过去 7 天」窗口就查无此票）。
+        today=datetime(2026, 10, 30, tzinfo=timezone.utc),
     )
     assert report_path.exists()
     content = report_path.read_text(encoding="utf-8")
