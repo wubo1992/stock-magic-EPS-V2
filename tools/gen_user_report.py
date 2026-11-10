@@ -391,6 +391,7 @@ class WatchView:
 class ReportData:
     date_str: str
     data_day: str | None
+    session_day: str | None = None
     today_main: list[SignalView] = field(default_factory=list)
     history_main: list[SignalView] = field(default_factory=list)
     today_cross: list[SignalView] = field(default_factory=list)
@@ -557,10 +558,16 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
     main_views = _build_signal_views(main, date_str, cache_dir, universe)
     cross_views = _build_signal_views(cross, date_str, cache_dir, universe)
 
+    market = _market_snapshot(cache_dir)
+    spy = market.get("spy")
+    # 最近一个**已完成**交易日（数据日）—— 回踩标的是它实际发生的那根 K 线日期，
+    # 不是运行日，所以「今日新增回踩」必须按数据日判定，否则这一段永远是空的。
+    session_day = spy.last_day if spy else None
+
     for v in main_views:
         v.is_today = v.date == date_str
     for v in cross_views:
-        v.is_today = v.date == date_str
+        v.is_today = v.date == (session_day or date_str)
 
     # 同标的被更新的信号取代 → 老行标记「已被取代」
     newest: dict[str, str] = {}
@@ -578,7 +585,7 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
         today_cross=[v for v in cross_views if v.is_today],
         history_cross=[v for v in cross_views if not v.is_today],
         watch=_build_watch_views(watchlist, cache_dir, today),
-        market=_market_snapshot(cache_dir),
+        market=market,
         universe=universe,
         sectors=sectors,
         rs_pool=_rs_pool_info(PROJECT_ROOT, date_str),
@@ -589,7 +596,10 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
     data.history_cross.sort(key=lambda v: v.date, reverse=True)
 
     days = {v.metrics.last_day for v in data.today_main + data.today_cross if v.metrics}
+    if session_day:
+        days.add(session_day)
     data.data_day = max(days) if days else None
+    data.session_day = session_day
     data.stale_symbols = [
         v.symbol for v in data.today_main
         if v.metrics and data.data_day and v.metrics.last_day != data.data_day
@@ -966,14 +976,15 @@ def render_markdown(data: ReportData, today: date) -> str:
     w("## 🚨 今日概览")
     w("")
     syms = " / ".join(v.symbol for v in d.today_main)
-    w(f"**{d.date_str}（周{weekday}）{n_today} 个新信号（Weinstein + EPS 主策略），{n_cross} 个 EMA10 回踩。**")
+    w(f"**{d.date_str}（周{weekday}）{n_today} 个新信号（Weinstein + EPS 主策略），"
+      f"{n_cross} 个 EMA10 回踩。**")
     w("")
     if d.today_main:
         w(f"- ✅ **v_eps_v2 主策略**：**{n_today} 个新增** —— {syms}")
     else:
         w("- ✅ **v_eps_v2 主策略**：**0 个新增**")
     if d.today_cross:
-        w(f"- 🟤 **EMA10 回踩子策略**：**{n_cross} 个新增** —— "
+        w(f"- 🟤 **EMA10 回踩子策略**：**{n_cross} 个新增**（回踩日 {d.session_day or d.date_str}）—— "
           + " / ".join(f"{v.symbol} ★{v.strength}" for v in d.today_cross))
     else:
         last = d.history_cross[0].date if d.history_cross else "—"
@@ -1024,7 +1035,7 @@ def render_markdown(data: ReportData, today: date) -> str:
     # ---------------- 段 1.5 ----------------
     w("## 📊 段 1.5：EMA10 回踩子策略（watchlist）")
     w("")
-    w("### 今日新增")
+    w(f"### 今日新增（回踩日 = 数据日 {d.session_day or d.date_str}）")
     w("")
     w("| 信号日期 | 股票 | 强度 | 现价 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 状态 |")
     w("|---------|------|------|------|----------|----------|------|----------|------|")
@@ -1032,7 +1043,7 @@ def render_markdown(data: ReportData, today: date) -> str:
         for v in d.today_cross:
             w(_cross_today_row(v))
     else:
-        w(f"| **{d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | ⚪ 今日无回踩 |")
+        w(f"| **{d.session_day or d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
     w("")
     if d.history_cross:
         w("### 过去 7 天 watchlist 回踩")
@@ -1269,6 +1280,11 @@ def render_markdown(data: ReportData, today: date) -> str:
     else:
         caveats.append("**VIX 不可用**：本地没有可用的 VIX 行情，本报告**不报 VIX 数值**。")
     caveats.append("**「连续环比季度」空白 ≠ 数据缺失**：表示该股没有连续 2 季环比增长，只有单季为正。")
+    caveats.append(
+        "**主策略与回踩的日期口径不同**：主策略标的是**运行日**（UTC），"
+        f"回踩标的是**它实际发生的那根 K 线日期**（数据日 {d.session_day or d.date_str}）—— "
+        "两者执行时点都是下一个美股开盘。段 1.5 的「今日新增」按**数据日**判定。"
+    )
     caveats.append(
         "**历史行未按新口径重算**：段 1 里今日行的量比/均线/突破是按交易日重算的；"
         "历史行沿用当时入库的值，两种口径不可直接比。"

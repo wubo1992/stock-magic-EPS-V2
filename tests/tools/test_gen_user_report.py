@@ -209,6 +209,43 @@ def test_missing_cache_symbol_does_not_crash(env):
     assert "DEAD" in md  # 有缓存的 DEAD 进表；无缓存的走缺失分支也不崩
 
 
+def test_crossback_on_session_day_is_todays_new_crossback(env):
+    """回踩标的是**它实际发生的那根 K 线日期**，不是运行日。
+
+    所以「今日新增回踩」不能按运行日过滤 —— 那样永远为空，
+    今天才第一次检出的新回踩会被埋进「过去 7 天」段里看不见。
+    判据应该是「发生在最近一个已完成交易日（数据日）」。
+    """
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    for date, symbol in (("2026-11-05", "TEST"), ("2026-11-03", "DEAD")):
+        rows.append({
+            "日期": date, "股票": symbol, "信号": "买入", "信号类型": "crossback_buy",
+            "强度(1-5)": "4", "参考止损": "$16.33",
+            "触发原因": "[EMA10回踩] 上穿EMA10($17.20, +1.5%) + 量能2.0x均量",
+            "RS相对强度": "53", "RS/SPY": "0.27", "RS-10W": "1.13", "RS-10D": "1.07",
+            "板块排名": "273/664",
+        })
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    # 段 1.5 的「今日新增」表里应该有数据日发生的回踩（数据日 = 2026-11-05）
+    today_section = md.split("### 今日新增")[1].split("###")[0]
+    assert "**TEST**" in today_section, f"数据日发生的回踩没进「今日新增」：\n{today_section}"
+    assert "2026-11-05" in today_section, f"回踩日期没显示：\n{today_section}"
+    assert "**DEAD**" not in today_section, f"更早的回踩被误当成今日新增：\n{today_section}"
+    # 更早的回踩留在「过去 7 天」段里，且数据日那条不能重复出现
+    history_section = md.split("### 过去 7 天 watchlist 回踩")[1].split("\n## ")[0]
+    assert "DEAD" in history_section, f"历史回踩丢了：\n{history_section}"
+    assert "TEST" not in history_section, "回踩同时出现在两段里，重复了"
+
+
 def test_cli_prints_paste_block(env, capsys):
     """CLI 必须把「信号表 / 三条建议 / 大盘一行」直接打到 stdout。
 
