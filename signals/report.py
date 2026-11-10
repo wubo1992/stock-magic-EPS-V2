@@ -20,6 +20,7 @@ from data.rs import (
     parse_rs_columns_from_reason,
     rs_unavailable_reason,
 )
+from data.stage import compute_stage
 
 # ── 路径 ───────────────────────────────────────────────────
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
@@ -239,6 +240,23 @@ def _load_cached_df(symbol: str, cache_dir) -> "object | None":
         return df
     except Exception:
         return None
+
+
+def _stage_text(symbol: str, cache_dir) -> str:
+    """当前 Weinstein 阶段（一行说明）—— 判不出来就说算不出来，不编。"""
+    if cache_dir is None:
+        return "—"
+    df = _load_cached_df(symbol, cache_dir)
+    if df is None:
+        return "—"
+    try:
+        result = compute_stage(df)
+    except Exception:
+        return "—"
+    if result.stage is None:
+        return f"—（{result.reason}）"
+    substage = f" · {result.substage}" if result.substage else ""
+    return f"{result.label}{substage} —— {result.reason}"
 
 
 def compute_recent_signal_pnl(watchlist: dict, today: datetime, cache_dir=None) -> list[dict]:
@@ -698,6 +716,7 @@ def _format_signal_detail(r: dict, is_today: bool, watchlist: dict | None = None
         f"| 信号日期 | {date_str} |",
         f"| 信号方向 | 买入 |",
         f"| 信号强度 | {stars}（{strength}/5） |",
+        f"| 阶段 | {_stage_text(symbol, cache_dir)} |",
         f"| RS 相对强度 | {rs_cell} |",
         f"| 参考止损 | {stop} |",
         f"| 建议操作 | {'明日开盘买入' if is_today else date_str + ' 次日已可执行'} |",

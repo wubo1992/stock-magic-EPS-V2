@@ -444,3 +444,45 @@ def test_rs_missing_on_a_pre_launch_record_still_blames_the_launch(tmp_path):
     )
 
     assert "该记录早于 RS Rating 上线" in content
+
+
+def test_signal_detail_shows_current_weinstein_stage(tmp_path):
+    """每条信号的「信号概览」都要写清当前处于哪个 Weinstein 阶段。
+
+    信号触发时必然是 Stage 2（那是入场条件），所以这一行的价值全在**事后跟踪**：
+    「这条信号现在还在不在 Stage 2」。
+    """
+    import pandas as pd
+    from signals.report import _build_report
+
+    # 阶段判定跑在周线上（参考实现要求 ≥60 根周线），
+    # 所以 fixture 必须是「45 周筑底 + 25 周主升」的周线形状 → Stage 2。
+    weekly = [50.0] * 45 + [50.0 * (1.02 ** (i + 1)) for i in range(25)]
+    closes: list[float] = []
+    for close in weekly:
+        closes.extend([close] * 5)
+    dates = pd.date_range(end="2026-11-02", periods=len(closes), freq="B", tz="UTC")
+    pd.DataFrame(
+        {
+            "open": closes,
+            "high": [c * 1.01 for c in closes],
+            "low": [c * 0.99 for c in closes],
+            "close": closes,
+            "volume": 1000,
+        },
+        index=dates,
+    ).to_pickle(tmp_path / "NEWCO.pkl")
+
+    record = {
+        "日期": "2026-11-02", "股票": "NEWCO", "信号": "买入",
+        "信号类型": "v_eps_v2_buy", "强度(1-5)": 3, "参考止损": "$9.66",
+        "触发原因": "[EPS] 最新季度EPS$0.48 | [量能] 1.9x均量",
+    }
+
+    content = _build_report(
+        "2026-11-02", [record], [], strategy_name="Weinstein + EPS",
+        cache_dir=tmp_path,
+    )
+
+    assert "| 阶段 |" in content, "信号概览里没有「阶段」这一行"
+    assert "Stage 2" in content, "稳步上涨的票应是 Stage 2"

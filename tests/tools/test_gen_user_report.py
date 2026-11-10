@@ -9,6 +9,7 @@
 """
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -19,7 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.gen_user_report import build_user_report, main  # noqa: E402
+from data.stage import LABELS, StageResult  # noqa: E402
+from tools.gen_user_report import _format_stage_cell, build_user_report, main  # noqa: E402
 
 SIGNAL_DATE = "2026-11-06"
 CSV_HEADER = [
@@ -41,6 +43,40 @@ def _make_bars(n: int, close: float, volume: float) -> pd.DataFrame:
         {"open": close, "high": close, "low": close, "close": close, "volume": volume},
         index=dates,
     )
+
+
+def _write_weekly_pkl(path: Path, weekly_closes: list[float], end: str = "2026-11-05") -> None:
+    """把周收盘价展开成日线写盘 —— 阶段判定跑在周线上，fixture 必须是周线形状。
+
+    参考实现（classical.py）要求至少 60 根周线，所以这里至少 60 周。
+    """
+    daily: list[float] = []
+    for close in weekly_closes:
+        daily.extend([close] * 5)
+    dates = pd.date_range(end=end, periods=len(daily), freq="B", tz="UTC")
+    pd.to_pickle(
+        pd.DataFrame(
+            {
+                "open": daily,
+                "high": [c * 1.01 for c in daily],
+                "low": [c * 0.99 for c in daily],
+                "close": daily,
+                "volume": 100_000,
+            },
+            index=dates,
+        ),
+        path,
+    )
+
+
+def _stage2_weekly() -> list[float]:
+    """45 周筑底 + 25 周主升 → Stage 2。"""
+    return [50.0] * 45 + [50.0 * (1.02 ** (i + 1)) for i in range(25)]
+
+
+def _stage4_weekly() -> list[float]:
+    """70 周连续下跌 → Stage 4。"""
+    return [300.0 * (0.97 ** (i + 1)) for i in range(70)]
 
 
 def _with_duplicate_bars(df: pd.DataFrame, dup_from: int) -> pd.DataFrame:
@@ -268,3 +304,133 @@ def test_cli_prints_paste_block(env, capsys):
     assert "TEST" in out, f"信号表里没有当日信号：\n{out}"
     # 量比 ≥2x 必须带 ⚡ —— 与 md 段 1 的标记口径一致
     assert "2.0x ⚡" in out, f"放量没标 ⚡：\n{out}"
+
+
+def _main_row(md: str) -> str:
+    rows = [ln for ln in md.splitlines() if ln.startswith("| **2026-11-06** | **TEST**")]
+    assert rows, "段 1 的表里没有今日信号行"
+    return rows[0]
+
+
+def test_stage_column_is_rendered_for_every_signal(env):
+    """每条信号都要有一列 Weinstein 阶段 —— 回答「这条信号现在还在不在 Stage 2」。"""
+    _write_weekly_pkl(env["cache_dir"] / "TEST.pkl", _stage2_weekly())
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    assert "| 股票 | 阶段 |" in md, "段 1 表头缺「阶段」列"
+    row = _main_row(md)
+    assert re.search(r"Stage [1-4]", row), f"行里没有阶段：{row}"
+
+
+def test_stage_column_shows_dash_when_history_is_too_short(env):
+    """周线不足 60 根 → 阶段判不了，显示「—」而不是编一个阶段出来。"""
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    row = _main_row(md)
+    assert "—" in row, f"历史不足应显示「—」：{row}"
+
+
+def test_stage_is_computed_not_hardcoded(env):
+    """筑底后主升的票 = Stage 2；阶段必须是算出来的，不是写死的。"""
+    _write_weekly_pkl(env["cache_dir"] / "TEST.pkl", _stage2_weekly())
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    row = _main_row(md)
+    assert "Stage 2" in row, f"上涨的票应是 Stage 2，实际：{row}"
+
+
+def test_stage_column_is_in_paste_block(env, capsys):
+    """可贴片段（每天只贴三样）也必须带阶段列 —— 那一列就是用户最想看的。"""
+    rc = main([
+        "--date", env["date"],
+        "--signals", str(env["signals_csv"]),
+        "--watchlist", str(env["watchlist"]),
+        "--cache-dir", str(env["cache_dir"]),
+        "--universe", str(env["universe"]),
+        "--out-dir", str(env["cache_dir"].parent / "out"),
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "| 股票 | 阶段 |" in out, f"可贴片段缺阶段列：\n{out}"
+
+
+def test_stage_field_is_documented(env):
+    """段 2 字段说明必须解释「阶段」是什么（不然读者看不懂这一列）。"""
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    assert "**阶段**" in md, "字段说明里没有「阶段」条目"
+
+
+def test_stage_4_stock_is_called_out_in_attention(env):
+    """已经跌成 Stage 4 的信号必须在「注意」里被点名 —— 阶段列不能只是装饰。"""
+    _write_weekly_pkl(env["cache_dir"] / "TEST.pkl", _stage4_weekly())
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    attention = md.split("### ⚠️ **注意**")[1].split("\n### ")[0]
+    assert "Stage 4" in attention, f"Stage 4 没被点名：\n{attention}"
+    assert "TEST" in attention
+
+
+def test_stage_warning_merges_into_existing_row(env):
+    """同一只票既被别的规则点名、又已经 Stage 4 → 合并成一行，不能占两行。"""
+    _write_weekly_pkl(env["cache_dir"] / "TEST.pkl", _stage4_weekly())
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    attention = md.split("### ⚠️ **注意**")[1].split("\n### ")[0]
+    rows = [ln for ln in attention.splitlines() if ln.startswith("| **TEST**")]
+    assert len(rows) == 1, f"TEST 应只有一行，实际 {len(rows)} 行：\n{attention}"
+    assert "Stage 4" in rows[0]
+
+
+def _sr(stage, substage=None, developing=False, confirmed_stage=None, confirmed_substage=None):
+    """造一个阶段判定结果（不跑真实行情 —— 这一层只管怎么写进表格）。"""
+    return StageResult(
+        stage=stage, label=LABELS.get(stage, "—"), reason="测试用", substage=substage,
+        developing=developing, confirmed_stage=confirmed_stage,
+        confirmed_substage=confirmed_substage,
+    )
+
+
+def test_stage_cell_plain_when_week_is_complete():
+    """周线已收完 → 就写阶段，不加任何修饰。"""
+    assert _format_stage_cell(_sr(2, "2")) == "**Stage 2 上升期 · 2**"
+
+
+def test_stage_cell_silent_when_developing_but_stage_unchanged():
+    """发展中但阶段跟上一完整周一样 → 不刷「发展中」噪声（参考实现口径：确认读数才作数）。"""
+    text = _format_stage_cell(_sr(2, "2", developing=True, confirmed_stage=2, confirmed_substage="2A"))
+    assert "发展中" not in text
+    assert "待定" not in text
+    assert "Stage 2" in text
+
+
+def test_stage_cell_flags_stage_flip_from_partial_week():
+    """这一周把阶段翻掉了 → 必须标「待定」并写出上一完整周读数，否则就是误报。"""
+    text = _format_stage_cell(_sr(1, "1A", developing=True, confirmed_stage=4, confirmed_substage="4B-"))
+    assert "待定" in text
+    assert "上周" in text
+    assert "Stage 4" in text
+    assert "下跌期" in text
+
+
+def test_stage_cell_keeps_stage_3_and_4_marks():
+    """Stage 3/4 是「该走了」，标记不能因为发展中判定而丢掉。"""
+    assert "⚠" in _format_stage_cell(_sr(3, "3"))
+    assert "🔴" in _format_stage_cell(_sr(4, "4"))
+    assert _format_stage_cell(_sr(None)) == "—"
+

@@ -44,6 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.daily_bars import dedup_daily_bars  # noqa: E402
+from data.stage import LABELS, STAGE_NAMES, StageResult, compute_stage  # noqa: E402
 
 MINUS = "\u2212"  # 减号，比 ASCII '-' 排版好看
 MAIN_TYPE = "v_eps_v2_buy"
@@ -372,6 +373,7 @@ class SignalView:
     is_today: bool = False
     superseded_by: str | None = None
     stop_pct: float | None = None
+    stage: StageResult | None = None
 
 
 @dataclass
@@ -418,6 +420,9 @@ def _build_signal_views(
         parsed = parse_reason(rec.get("触发原因", ""))
         df = _load_bars(cache_dir, symbol)
         metrics = _compute_metrics(df, symbol) if df is not None else None
+        # Weinstein 四阶段：判**当前**处于哪个阶段（信号触发时必然是 Stage 2，
+        # 那一列的全部价值在事后跟踪「现在还在不在 Stage 2」）
+        stage = compute_stage(df) if df is not None else None
         info = universe.get(symbol, {}) if isinstance(universe, dict) else {}
 
         rs_rating = _num(rec, "RS相对强度")
@@ -457,6 +462,7 @@ def _build_signal_views(
                 sector_rank=sector_rank,
                 name=info.get("name"),
                 stop_pct=(stop / metrics.px - 1.0) * 100.0 if stop and metrics else None,
+                stage=stage,
             )
         )
     return views
@@ -613,6 +619,10 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
 FIELD_GLOSSARY = [
     ("信号日期", "策略检测到条件的日期（UTC 运行日）", "**不等于**执行日；下一个美股开盘执行"),
     ("股票", "美股代码", "先看板块，再看公司名（名称来自 Nasdaq screener）"),
+    ("阶段", "Weinstein 四阶段（按**最新一根 K 线**判定的当前阶段，含 A/B 子阶段）",
+     "Stage 2 还在上涨 = 继续持有｜Stage 3 顶部 ⚠ = 减仓｜Stage 4 下跌 🔴 = 离场｜"
+     "Stage 1 筑底 = 升势中断，回到起点｜「待定」= 本周未收完、且这一周把阶段翻掉了"
+     "（括号里是上一完整周的读数）"),
     ("强度", "信号强度星级（1-5）", "★ 越多 = 技术面 + 基本面同时越干净"),
     ("参考止损", "入场后立即挂的止损价", "= 信号日收盘 × 0.92（**−8%**）；破位离场，不扛单"),
     ("最新季度 EPS", "最近一个财季的每股收益", "**为负说明还在亏损**，\"亏损收窄\"≠ 增长"),
@@ -731,11 +741,51 @@ def _streak_cell(n: int | None, bold: bool = True) -> str:
     return text + (" 🔥" if n >= 4 else "")
 
 
+def _format_stage_cell(s: StageResult, bold: bool = True) -> str:
+    """把阶段判定结果写成表格里的一格。
+
+    规则（照参考实现 classical.py 的口径来）：
+    - 阶段是「按最新一根 K 线判定的当前阶段」，带 A/B 子阶段；
+    - 本周未收完时这根周线是「发展中」的暂定读数 —— 但只有当它**把阶段翻掉了**
+      （与上一完整周的主阶段不同）才标「待定」并写出上一完整周读数。
+      没翻就不标，避免整张表每行都挂一个没信息量的「发展中」。
+    - Stage 3/4 是「该走了」，加标记，一眼看见。
+    """
+    if s is None or s.stage is None:
+        return "—"
+    text = s.label
+    if s.substage:
+        text = f"{text} · {s.substage}"
+    if s.developing and s.confirmed_stage is not None and s.confirmed_stage != s.stage:
+        confirmed = f"Stage {s.confirmed_stage} {STAGE_NAMES.get(s.confirmed_stage, '')}".strip()
+        if s.confirmed_substage:
+            confirmed = f"{confirmed} · {s.confirmed_substage}"
+        text = f"{text}（待定，上周 {confirmed}）"
+    if bold:
+        text = f"**{text}**"
+    if s.stage == 3:
+        return text + " ⚠"
+    if s.stage == 4:
+        return text + " 🔴"
+    return text
+
+
+def _stage_cell(v: SignalView, bold: bool = True) -> str:
+    """Weinstein 阶段（按最新一根 K 线判定的**当前**阶段）。
+
+    判据来自参考实现的经典结构引擎（周线 + 30 周均线 + 高低点/区间结构），
+    见 `data/stage.py`。带子阶段（2A/2/2B…）；本周未收完且阶段被翻掉时标「待定」。
+    Stage 3/4 加标记 —— 这两种阶段是「该走了」的信号，得一眼看见。
+    """
+    return _format_stage_cell(v.stage, bold=bold)
+
+
 def _main_row(v: SignalView) -> str:
     p = v.parsed
     cells = [
         f"**{v.date}**",
         f"**{v.symbol}**",
+        _stage_cell(v),
         _stars(v.strength),
         f"**{_money(v.stop)}**",
         f"**{_money(p.get('eps'))}**",
@@ -761,6 +811,7 @@ def _history_row(v: SignalView) -> str:
     cells = [
         v.date,
         v.symbol,
+        _stage_cell(v, bold=False),
         _stars(v.strength),
         _money(v.stop),
         _money(p.get("eps")),
@@ -802,6 +853,7 @@ def _cross_today_row(v: SignalView) -> str:
     cells = [
         f"**{v.date}**",
         f"**{v.symbol}**",
+        _stage_cell(v),
         _stars(v.strength),
         _money(v.metrics.px if v.metrics else None),
         _money(p.get("cb_close")),
@@ -818,6 +870,7 @@ def _cross_history_row(v: SignalView) -> str:
     cells = [
         v.date,
         v.symbol,
+        _stage_cell(v, bold=False),
         _stars(v.strength),
         _money(p.get("cb_close")),
         _pct(p.get("cb_pct")),
@@ -887,6 +940,29 @@ def _attention_rows(data: ReportData) -> list[tuple[str, str, str]]:
             rows.append((f"{v.symbol}（{v.date}）",
                          f"现价 **{_money(m.px)}**，已低于 {_money(v.stop)} 止损 **{_f(abs((m.px / v.stop - 1) * 100))}%**",
                          "🛑 **信号已失效** —— 不要按原止损挂单，也不要因为 RS 强就重新抄底"))
+
+    # 阶段退化：信号发出后已经不在 Stage 2 了 —— 这是最该先看的一条
+    seen: set[tuple[str, int]] = set()
+    for v in data.today_main + data.history_main + data.today_cross + data.history_cross:
+        s = v.stage
+        if s is None or s.stage not in (3, 4):
+            continue
+        key = (v.symbol, s.stage)
+        if key in seen:
+            continue
+        seen.add(key)
+        if s.stage == 4:
+            advice = "🛑 **趋势已坏**（SMA150 已转向下跌）→ 按止损离场，不要因为 RS 强就扛单"
+        else:
+            advice = "🟡 **动能衰竭** → 减仓 / 收紧止损，不要按原计划加仓"
+        problem = f"已是 **{s.label}** —— {s.reason}"
+        # 同一只票已经有行了 → 合并进那一行（阶段比「当日涨了多少」更重要）
+        for i, (sym, prob, _adv) in enumerate(rows):
+            if sym.split("（")[0] == v.symbol:
+                rows[i] = (sym, f"{prob}；{problem}", advice)
+                break
+        else:
+            rows.append((f"{v.symbol}（{v.date}）", problem, advice))
     return rows
 
 
@@ -1004,18 +1080,18 @@ def render_markdown(data: ReportData, today: date) -> str:
     # ---------------- 段 1 ----------------
     w("## 📊 段 1：完整信号表（v_eps_v2 主策略，今日 + 过去 7 天）")
     w("")
-    w("| 信号日期 | 股票 | 强度 | 参考止损 | 最新季度 EPS | EPS 同比 (YoY) | EPS 环比 (QoQ) "
+    w("| 信号日期 | 股票 | 阶段 | 强度 | 参考止损 | 最新季度 EPS | EPS 同比 (YoY) | EPS 环比 (QoQ) "
       "| 连续同比季度 | 连续环比季度 | 量比 (vs/20日均量) | RS Rating | RS/SPY (长期) "
       "| RS-10W (10周) | RS-10D (10日) | 板块 | 板块排名 | 状态 |")
-    w("|---------|------|------|----------|-------------|---------------|---------------|-------------|"
+    w("|---------|------|------|------|----------|-------------|---------------|---------------|-------------|"
       "-------------|------------------|-----------|----------------|----------------|---------------|"
-      "--------|---------|------|")
+      "--------|---------|------|------|")
     for v in d.today_main:
         w(_main_row(v))
     for v in d.history_main:
         w(_history_row(v))
     if not d.today_main and not d.history_main:
-        w("| — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | **窗口内无信号** |")
+        w("| — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | **窗口内无信号** |")
     w("")
     w("**汇总**：")
     by_date: dict[str, int] = {}
@@ -1030,6 +1106,14 @@ def render_markdown(data: ReportData, today: date) -> str:
     w("> **注 2**：今日行的**量比是按交易日重算的**；历史行的量比沿用当时入库的值（未按新口径重算），"
       "两行不可直接比。")
     w("> **注 3**：RS 四列全是「—」= **算不出来**（不是弱）—— 通常是可用日线不足 253 根门槛，没进 RS 排名池。")
+    w(f"> **注 4**：「阶段」是按**最新一根 K 线**（{data_day}）判定的**当前** Weinstein 阶段，"
+      "不是信号触发那天的阶段（触发时必然是 Stage 2，那没信息量）。"
+      "判据 = 周线 30 周均线 + 4 周斜率 + 26 周区间 + 高低点结构（移植自参考实现 "
+      "`weinstein/classical.py`，规则版本 WEINSTEIN-STRUCTURE-1.3），"
+      "子阶段用 A/B 后缀（2A/2/2B…）表示；「待定」= 本周尚未收完、且这一周把阶段翻掉了"
+      "（括号里是上一完整周的读数）；周线没收完但阶段没变的照常显示，不标「待定」；"
+      "「—」= 周线不足 60 根，判不了。"
+      "⚠ = Stage 3 顶部（减仓），🔴 = Stage 4 下跌（离场）。")
     w("")
 
     # ---------------- 段 1.5 ----------------
@@ -1037,19 +1121,19 @@ def render_markdown(data: ReportData, today: date) -> str:
     w("")
     w(f"### 今日新增（回踩日 = 数据日 {d.session_day or d.date_str}）")
     w("")
-    w("| 信号日期 | 股票 | 强度 | 现价 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 状态 |")
-    w("|---------|------|------|------|----------|----------|------|----------|------|")
+    w("| 信号日期 | 股票 | 阶段 | 强度 | 现价 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 状态 |")
+    w("|---------|------|------|------|------|----------|----------|------|----------|------|")
     if d.today_cross:
         for v in d.today_cross:
             w(_cross_today_row(v))
     else:
-        w(f"| **{d.session_day or d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
+        w(f"| **{d.session_day or d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
     w("")
     if d.history_cross:
         w("### 过去 7 天 watchlist 回踩")
         w("")
-        w("| 回踩日 | 股票 | 强度 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 现价 | 状态 |")
-        w("|--------|------|------|----------|----------|------|----------|------|------|")
+        w("| 回踩日 | 股票 | 阶段 | 强度 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 现价 | 状态 |")
+        w("|--------|------|------|------|----------|----------|------|----------|------|------|")
         for v in d.history_cross:
             w(_cross_history_row(v))
         w("")
@@ -1339,13 +1423,14 @@ def build_paste_block(data: ReportData) -> str:
     lines: list[str] = []
     lines.append(f"**信号表（今日 {len(data.today_main)} 个）**")
     lines.append("")
-    lines.append("| 股票 | 强度 | 止损 | EPS | YoY | QoQ | 量比 | RS | RS/SPY | 10W | 10D | 板块 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| 股票 | 阶段 | 强度 | 止损 | EPS | YoY | QoQ | 量比 | RS | RS/SPY | 10W | 10D | 板块 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for v in data.today_main:
         p = v.parsed
         ratio = _vol_cell(v, recompute=True, bold=False)
         lines.append(
-            f"| **{v.symbol}** | {_stars(v.strength)} | {_money(v.stop)} | {_money(p.get('eps'))} | "
+            f"| **{v.symbol}** | {_stage_cell(v, bold=False)} | {_stars(v.strength)} | {_money(v.stop)} | "
+            f"{_money(p.get('eps'))} | "
             f"{p.get('yoy') or '—'} | {p.get('qoq') or '—'} | {ratio} | "
             f"{int(v.rs_rating) if v.rs_rating is not None else '—'} | {_x(v.rs_spy)} | "
             f"{_x(v.rs_10w)} | {_x(v.rs_10d)} | {v.sector or '—'} |"
