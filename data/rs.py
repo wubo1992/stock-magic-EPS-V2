@@ -1081,16 +1081,23 @@ def _load_rs_daily_cache(path: Path) -> dict:
         return {}
 
 
-def _save_rs_daily_cache(cache: dict, path: Path) -> None:
-    """保存 rs_daily_cache.json，保留最近 RS_DAILY_CACHE_MAX_DAYS 天的数据。"""
+def _save_rs_daily_cache(cache: dict, path: Path, keep_date: str | None = None) -> None:
+    """保存 rs_daily_cache.json，保留最近 RS_DAILY_CACHE_MAX_DAYS 天的数据。
+
+    keep_date 是**本次刚写入**的日期键，必须留在缓存里。
+    缓存满了的时候，回踩信号会一直往前追（写到比最老那天还老的日期），
+    滚动窗口会把这个刚写的条目自己挤掉：写进去 → 落盘前被 pop →
+    调用方再读回来是空的 → RS Rating / 板块排名变成 None，**全程不报任何错**。
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 滚动：删除超过保留期的日期
+        # 滚动：删除超过保留期的日期（刚写的那天除外）
         if cache:
             all_dates = sorted(cache.keys())
             if len(all_dates) > RS_DAILY_CACHE_MAX_DAYS:
                 for d in all_dates[:-RS_DAILY_CACHE_MAX_DAYS]:
-                    cache.pop(d, None)
+                    if d != keep_date:
+                        cache.pop(d, None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=1, sort_keys=True)
     except Exception:
@@ -1228,7 +1235,7 @@ def _populate_sector_cache(
         "rs_list": rs_list,
         "pool_sig": _sector_pool_signature(sector, sector_cache_path, universe_path),
     }
-    _save_rs_daily_cache(cache, rs_daily_cache_path)
+    _save_rs_daily_cache(cache, rs_daily_cache_path, keep_date=date_str)
     return True
 
 
@@ -1446,7 +1453,7 @@ def _populate_universe_cache(
         "pool_sig": pool_sig,
         "source": source,
     }
-    _save_rs_daily_cache(cache, rs_daily_cache_path)
+    _save_rs_daily_cache(cache, rs_daily_cache_path, keep_date=date_str)
     return True
 
 

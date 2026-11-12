@@ -267,17 +267,60 @@ def _append_to_csv(records: list[dict], strategy_id: str = "v1_wizard") -> None:
     # Normal append
     file_exists_after = signals_csv.exists()
 
-    # 去重：按（日期，股票，信号类型）跳过已有记录，避免 crossback 等历史事件重复追加
-    existing_keys: set[tuple] = set()
+    # 读现有行（完整行，不只是 key）—— 同键时要**覆盖**而不是跳过
+    existing_rows: list[dict] = []
+    fieldnames = list(_CSV_HEADERS)
     if file_exists_after:
         try:
             with open(signals_csv, "r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.DictReader(f)
-                if reader.fieldnames and "日期" in reader.fieldnames and "股票" in reader.fieldnames and "信号类型" in reader.fieldnames:
-                    for row in reader:
-                        existing_keys.add((row.get("日期"), row.get("股票"), row.get("信号类型")))
+                if reader.fieldnames and "日期" in reader.fieldnames \
+                        and "股票" in reader.fieldnames and "信号类型" in reader.fieldnames:
+                    fieldnames = list(reader.fieldnames)
+                    existing_rows = list(reader)
+                else:
+                    existing_rows = []
         except Exception:
-            existing_keys = set()
+            existing_rows = []
+
+    rows: list[dict] = list(existing_rows)
+    pos_by_key: dict[tuple, int] = {}
+    for i, row in enumerate(rows):
+        key = (row.get("日期"), row.get("股票"), row.get("信号类型"))
+        pos_by_key.setdefault(key, i)   # 同键重复的历史行只覆盖第一次出现的那行
+
+    overwritten = 0
+    for r in records:
+        key = (r["日期"], r["股票"], r.get("信号类型", V_EPS_V2_BUY_SIGNAL_TYPE))
+        new_row = {
+            "日期": r["日期"],
+            "股票": r["股票"],
+            "信号": r["信号"],
+            "信号类型": r.get("信号类型", V_EPS_V2_BUY_SIGNAL_TYPE),
+            "强度(1-5)": r["强度(1-5)"],
+            "触发原因": r["触发原因"],
+            "参考止损": r["参考止损"],
+            **{col: r.get(col, "") for col in RS_COLUMN_NAMES},
+        }
+        if key in pos_by_key:
+            # 同键 → 覆盖旧行：数据刷新后重算的 量能/涨幅/强度/RS 比首次写入的值准
+            rows[pos_by_key[key]] = new_row
+            overwritten += 1
+        else:
+            pos_by_key[key] = len(rows)
+            rows.append(new_row)
+
+    if overwritten and file_exists_after:
+        # 有覆盖 → 整个文件重写（原子替换：先写临时文件再 rename，中途崩了也不会写坏）
+        tmp_path = signals_csv.with_suffix(".csv.tmp")
+        with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        tmp_path.replace(signals_csv)
+        print(f"[输出] 信号已保存到 {signals_csv}（覆盖更新 {overwritten} 行）")
+        return
 
     with open(signals_csv, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
@@ -288,20 +331,7 @@ def _append_to_csv(records: list[dict], strategy_id: str = "v1_wizard") -> None:
         if not file_exists_after:
             writer.writeheader()
 
-        for r in records:
-            key = (r["日期"], r["股票"], r.get("信号类型", V_EPS_V2_BUY_SIGNAL_TYPE))
-            if key in existing_keys:
-                continue
-            writer.writerow({
-                "日期": r["日期"],
-                "股票": r["股票"],
-                "信号": r["信号"],
-                "信号类型": r.get("信号类型", V_EPS_V2_BUY_SIGNAL_TYPE),
-                "强度(1-5)": r["强度(1-5)"],
-                "触发原因": r["触发原因"],
-                "参考止损": r["参考止损"],
-                **{col: r.get(col, "") for col in RS_COLUMN_NAMES},
-            })
-            existing_keys.add(key)
+        for row in rows[len(existing_rows):]:
+            writer.writerow(row)
 
     print(f"[输出] 信号已保存到 {signals_csv}")
