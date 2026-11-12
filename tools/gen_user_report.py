@@ -136,6 +136,26 @@ def _load_bars(cache_dir: Path, symbol: str) -> pd.DataFrame | None:
     return df
 
 
+def _close_on_date(df: pd.DataFrame | None, date_str: str) -> float | None:
+    """取某个交易日的**真实收盘价**（按 UTC 日期匹配，先 dedup 掉同日双 bar）。
+
+    信号里的 `上穿EMA10($X)` 只带 EMA10，不带收盘价 —— 收盘价只能从这里取。
+    """
+    if df is None or not date_str:
+        return None
+    d = dedup_daily_bars(df)
+    if d is None or d.empty or "close" not in d.columns:
+        return None
+    try:
+        target = date.fromisoformat(str(date_str)[:10])
+    except ValueError:
+        return None
+    for ts, close in zip(d.index, d["close"]):
+        if pd.Timestamp(ts).date() == target:
+            return float(close)
+    return None
+
+
 def _compute_metrics(df: pd.DataFrame, symbol: str) -> Metrics | None:
     """把日线 df 折成一组指标。窗口一律按**交易日**（先 dedup）。"""
     d = dedup_daily_bars(df)
@@ -309,8 +329,10 @@ def parse_reason(reason: str) -> dict:
         out["sector"] = m.group(1).strip()
         out["sector_rank"] = f"{m.group(2)}/{m.group(3)}"
 
+    # `上穿EMA10($X, ...)` 里的 $X 是 **EMA10**，不是那天的收盘价 ——
+    # 收盘价必须去行情缓存按日期取（_close_on_date）。
     m = _RE_CB_CLOSE.search(reason)
-    out["cb_close"] = float(m.group(1)) if m else None
+    out["cb_ema10"] = float(m.group(1)) if m else None
     m = _RE_CB_PCT.search(reason)
     out["cb_pct"] = float(m.group(1).replace("−", "-")) if m else None
     m = _RE_CB_VOL.search(reason)
@@ -374,6 +396,9 @@ class SignalView:
     superseded_by: str | None = None
     stop_pct: float | None = None
     stage: StageResult | None = None
+    cb_close: float | None = None   # 回踩当天的真实收盘价（从行情缓存按日期取）
+    cb_ema10: float | None = None   # 回踩当天被上穿的 EMA10（从触发原因解析）
+    cb_close_est: bool = False      # cb_close 是反推值（缓存里没有那根 bar）
 
 
 @dataclass
@@ -444,6 +469,16 @@ def _build_signal_views(
             sector_rank = None
 
         stop = _to_float(rec.get("参考止损"))
+        cb_close = cb_close_est = None
+        if rec.get("信号类型") == CROSSBACK_TYPE:
+            cb_close = _close_on_date(df, rec.get("日期", ""))
+            if cb_close is None:
+                # 缓存里没有那天的 bar → 用 (close−EMA10)/EMA10 的定义反推
+                ema10 = parsed.get("cb_ema10")
+                pct = parsed.get("cb_pct")
+                if ema10 is not None and pct is not None:
+                    cb_close = ema10 * (1.0 + pct / 100.0)
+                    cb_close_est = True
         views.append(
             SignalView(
                 date=rec.get("日期", ""),
@@ -463,6 +498,9 @@ def _build_signal_views(
                 name=info.get("name"),
                 stop_pct=(stop / metrics.px - 1.0) * 100.0 if stop and metrics else None,
                 stage=stage,
+                cb_close=cb_close,
+                cb_close_est=bool(cb_close_est),
+                cb_ema10=parsed.get("cb_ema10"),
             )
         )
     return views
@@ -509,6 +547,22 @@ def _build_watch_views(watchlist: dict, cache_dir: Path, today: date) -> list[Wa
             )
         )
     return out
+
+
+def _spy_vol_label(spy) -> str:
+    """量能标签要同时看**量比和方向**。
+
+    只看涨跌方向会把 0.74x 的缩量上涨写成「放量上涨」—— 量能词必须跟着量比走。
+    """
+    vol = getattr(spy, "vol_ratio", None)
+    if vol is None:
+        return ""
+    up, down = spy.chg > 0, spy.chg < 0
+    if vol >= 1.2:
+        return "放量上涨" if up else "放量杀跌" if down else "放量"
+    if vol <= 0.8:
+        return "缩量上涨" if up else "缩量下跌" if down else "缩量"
+    return "平量上涨" if up else "平量下跌" if down else "平量"
 
 
 def _market_snapshot(cache_dir: Path) -> dict:
@@ -638,6 +692,22 @@ FIELD_GLOSSARY = [
     ("板块", "GICS 一级行业（Nasdaq screener 分类）", "用来看轮动；归类可疑的票看 caveat"),
     ("板块排名", "该股在全市场同行业里的 RS 强弱名次", "分母是全市场该行业总数（RS 排名池）"),
     ("状态", "执行建议 + 现价 + 当日涨跌", "🟢 可执行 / 🟡 未执行 / ⬛ 已被新信号取代 / 🔴 已破止损"),
+]
+
+CROSSBACK_GLOSSARY = [
+    ("信号日期 / 回踩日", "回踩**实际发生**的那根 K 线日期（数据日），不是运行日",
+     "执行时点与主策略一样 = 下一个美股开盘"),
+    ("触发收盘", "回踩当天的**真实收盘价**（从行情缓存按该日 bar 取）",
+     "`≈` = 缓存里没那根 bar，用 EMA10×(1+上穿涨幅) 反推的估算值"),
+    ("上穿EMA10", "回踩当天被上穿的 **EMA(10)** —— **不是收盘价**",
+     "价格从下方穿回这条均线；离得越近说明回踩越浅"),
+    ("上穿涨幅", "(触发收盘 − EMA10) ÷ EMA10", "涨幅大 = 穿得干脆；≤1% 常常是假突破"),
+    ("量比", "回踩当日成交量 ÷ 前 20 个**交易日**均量",
+     "≥1.5x 才有意义；1.5–2.0x→3★，2.0–3.0x→4★，≥3.0x→5★"),
+    ("参考止损", "该股 watchlist 条目的 stage2_stop = 主信号日收盘 × 0.92",
+     "破位离场，不因为「回踩成功」就放宽止损"),
+    ("现价", "最新一根 K 线（数据日）的收盘价", "跟触发收盘比 = 回踩之后走了多远"),
+    ("状态", "现价 vs 参考止损", "🟢 持有｜🟡 贴止损（3% 内）｜🔴 已破止损"),
 ]
 
 MONITOR_LEGEND = (
@@ -848,6 +918,14 @@ def _cross_status(v: SignalView) -> str:
     return "—"
 
 
+def _cross_close_cell(v: SignalView) -> str:
+    """回踩当天的收盘价 —— 反推值带「≈」，别让人当成精确报价。"""
+    if v.cb_close is None:
+        return "—"
+    text = _money(v.cb_close)
+    return f"≈{text}" if v.cb_close_est else text
+
+
 def _cross_today_row(v: SignalView) -> str:
     p = v.parsed
     cells = [
@@ -856,7 +934,8 @@ def _cross_today_row(v: SignalView) -> str:
         _stage_cell(v),
         _stars(v.strength),
         _money(v.metrics.px if v.metrics else None),
-        _money(p.get("cb_close")),
+        _cross_close_cell(v),
+        _money(v.cb_ema10),
         _pct(p.get("cb_pct")),
         f"**{_x(p.get('cb_vol'))}**" if p.get("cb_vol") is not None else "—",
         f"**{_money(v.stop)}**" if v.stop else "—",
@@ -872,7 +951,8 @@ def _cross_history_row(v: SignalView) -> str:
         v.symbol,
         _stage_cell(v, bold=False),
         _stars(v.strength),
-        _money(p.get("cb_close")),
+        _cross_close_cell(v),
+        _money(v.cb_ema10),
         _pct(p.get("cb_pct")),
         _x(p.get("cb_vol")),
         _money(v.stop),
@@ -1121,22 +1201,29 @@ def render_markdown(data: ReportData, today: date) -> str:
     w("")
     w(f"### 今日新增（回踩日 = 数据日 {d.session_day or d.date_str}）")
     w("")
-    w("| 信号日期 | 股票 | 阶段 | 强度 | 现价 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 状态 |")
-    w("|---------|------|------|------|------|----------|----------|------|----------|------|")
+    w("| 信号日期 | 股票 | 阶段 | 强度 | 现价 | 触发收盘 | 上穿EMA10 | 上穿涨幅 | 量比 | 参考止损 | 状态 |")
+    w("|---------|------|------|------|------|----------|-----------|----------|------|----------|------|")
     if d.today_cross:
         for v in d.today_cross:
             w(_cross_today_row(v))
     else:
-        w(f"| **{d.session_day or d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
+        w(f"| **{d.session_day or d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
     w("")
     if d.history_cross:
         w("### 过去 7 天 watchlist 回踩")
         w("")
-        w("| 回踩日 | 股票 | 阶段 | 强度 | 触发收盘 | 上穿涨幅 | 量比 | 参考止损 | 现价 | 状态 |")
-        w("|--------|------|------|------|----------|----------|------|----------|------|------|")
+        w("| 回踩日 | 股票 | 阶段 | 强度 | 触发收盘 | 上穿EMA10 | 上穿涨幅 | 量比 | 参考止损 | 现价 | 状态 |")
+        w("|--------|------|------|------|----------|-----------|----------|------|----------|------|------|")
         for v in d.history_cross:
             w(_cross_history_row(v))
         w("")
+    w("**段 1.5 字段说明**：")
+    w("")
+    w("| 字段 | 含义 | 怎么看 |")
+    w("|------|------|--------|")
+    for name, meaning, usage in CROSSBACK_GLOSSARY:
+        w(f"| **{name}** | {meaning} | {usage} |")
+    w("")
 
     # ---------------- 段 2 ----------------
     w("## 📚 段 2：字段说明")
@@ -1238,8 +1325,7 @@ def render_markdown(data: ReportData, today: date) -> str:
         w(f"| SPY 5 日 | **{_pct(spy.r5)}** | |")
         w(f"| SPY 10 日 | **{_pct(spy.r10)}** | |")
         w(f"| SPY 20 日 | **{_pct(spy.r20)}** | |")
-        w(f"| SPY 量比 | **{spy.vol_ratio:.2f}x** | "
-          f"{'放量杀跌' if spy.chg < 0 else '放量上涨' if spy.chg > 0 else ''} |")
+        w(f"| SPY 量比 | **{spy.vol_ratio:.2f}x** | {_spy_vol_label(spy)} |")
         if spy.sma150:
             w(f"| SPY vs SMA150（{_money(spy.sma150)}） | **{_pct(spy.px_vs_sma)}** | "
               f"{'已跌破均线' if spy.px_vs_sma < 0 else '仍在均线上'} |")

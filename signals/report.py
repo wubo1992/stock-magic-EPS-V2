@@ -20,6 +20,7 @@ from data.rs import (
     parse_rs_columns_from_reason,
     rs_unavailable_reason,
 )
+from data.daily_bars import dedup_daily_bars
 from data.stage import compute_stage
 
 # ── 路径 ───────────────────────────────────────────────────
@@ -380,7 +381,8 @@ def generate_daily_report(
 
     # === Crossback 区段（spec §4.3） ===
     if crossback_records is not None or watchlist_status is not None:
-        content += _build_crossback_section(crossback_records or [], watchlist_status or {})
+        content += _build_crossback_section(crossback_records or [], watchlist_status or {},
+                                            cache_dir=cache_dir)
 
     # === Watchlist EMA10 Crossback 状态（用户偏好：以后也把这种信号放到 livetest 报告里） ===
     if watchlist:
@@ -452,21 +454,24 @@ def _build_watchlist_crossback_section(watchlist: dict, today: datetime) -> str:
     return "\n".join(lines)
 
 
-def _build_crossback_section(crossback_records: list[dict], watchlist_status: dict) -> str:
+def _build_crossback_section(crossback_records: list[dict], watchlist_status: dict,
+                              cache_dir=None) -> str:
     """生成 EMA 10 Crossback 区段 Markdown（spec §4.3）。"""
     lines = ["", "---", "", "## EMA 10 Crossback 信号（自信号日以来）", ""]
 
     if crossback_records:
-        lines.append("| 日期 | 股票 | RS | 强度 | 现价 | 参考止损 | 量比 | 上穿 EMA10 | 上穿涨幅 |")
-        lines.append("|------|------|----|------|------|----------|------|-----------|---------|")
+        lines.append("| 日期 | 股票 | RS | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |")
+        lines.append("|------|------|----|------|----------|-----------|----------|------|---------|")
         for r in crossback_records:
             sections = _parse_reason(r.get("触发原因", ""))
             cb_text = sections.get("[EMA10回踩]", "")
             metrics = _parse_crossback_metrics(cb_text)
+            close_str = _crossback_close_str(
+                r.get("股票", ""), r.get("日期", ""), cache_dir, metrics["close_est"])
             lines.append(
                 f"| {r['日期']} | {r['股票']} | {_rs_rating_str(r)} | {r['强度星级']} "
-                f"| {metrics['close_str']} | {r.get('参考止损', '—')} "
-                f"| {metrics['vol_str']} | — | {metrics['pct_str']} |"
+                f"| {close_str} | {metrics['ema10_str']} | {r.get('参考止损', '—')} "
+                f"| {metrics['vol_str']} | {metrics['pct_str']} |"
             )
     else:
         lines.append("暂无 crossback 信号。")
@@ -885,14 +890,55 @@ def _parse_reason(reason: str) -> dict:
 
 
 def _parse_crossback_metrics(cb_text: str) -> dict:
-    """从 [EMA10回踩] 段文本里抽取 现价 / 上穿涨幅 / 量比。"""
-    m_close = re.search(r"\$(\d+\.\d+)", cb_text)
-    close_str = f"${m_close.group(1)}" if m_close else "—"
-    m_pct = re.search(r"\+(-?\d+\.\d+)%", cb_text)
-    pct_str = f"+{m_pct.group(1)}%" if m_pct else "—"
-    m_vol = re.search(r"量能(\d+\.\d+)x", cb_text)
-    vol_str = f"{m_vol.group(1)}x" if m_vol else "—"
-    return {"close_str": close_str, "pct_str": pct_str, "vol_str": vol_str}
+    """从 [EMA10回踩] 段文本里抽取 上穿EMA10 / 上穿涨幅 / 量比。
+
+    ⚠ `上穿EMA10($X, +Y%)` 里的 $X 是 **EMA10**，不是那天的收盘价 ——
+    以前这里把 $X 当成「现价」印出来，等于报告了一个不存在的数字。
+    收盘价要么去行情缓存按日期取（准），要么用 close = EMA10 × (1 + Y%) 反推（准到 Y% 的四舍五入）。
+    """
+    m_ema = re.search(r"上穿EMA10\(\$([\d.]+)", cb_text)
+    ema10 = float(m_ema.group(1)) if m_ema else None
+    m_pct = re.search(r"\+(-?[\d.]+)%", cb_text)
+    pct = float(m_pct.group(1)) if m_pct else None
+    m_vol = re.search(r"量能([\d.]+)x", cb_text)
+    vol = float(m_vol.group(1)) if m_vol else None
+    close_est = ema10 * (1 + pct / 100.0) if ema10 is not None and pct is not None else None
+    return {
+        "ema10": ema10,
+        "ema10_str": f"${ema10:.2f}" if ema10 is not None else "—",
+        "pct": pct,
+        "pct_str": f"+{pct:.1f}%" if pct is not None else "—",
+        "vol": vol,
+        "vol_str": f"{vol:.1f}x" if vol is not None else "—",
+        "close_est": close_est,
+    }
+
+
+def _crossback_close_str(symbol: str, date_str: str, cache_dir, derived: float | None) -> str:
+    """回踩当天的**真实收盘价**（显示字符串）。
+
+    优先从行情缓存按日期取（准）；取不到才用 EMA10×(1+涨幅) 反推，
+    反推值带 `≈` 前缀 —— 涨幅只有一位小数，精度不如缓存值。
+    """
+    df = _load_cached_df(symbol, cache_dir or DEFAULT_CACHE_DIR)
+    if df is not None:
+        try:
+            target = datetime.strptime(str(date_str)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            target = None
+        if target is not None:
+            d = dedup_daily_bars(df)
+            if "close" in getattr(d, "columns", []):
+                for ts, close in zip(d.index, d["close"]):
+                    try:
+                        day = ts.date()
+                    except AttributeError:
+                        continue
+                    if day == target:
+                        return f"${float(close):.2f}"
+    if derived is not None:
+        return f"≈${derived:.2f}"
+    return "—"
 
 
 def _interpret_trend(trend: str) -> list[str]:
@@ -1088,8 +1134,9 @@ def generate_crossback_report(
     lines.append("")
     lines.append("## 字段说明")
     lines.append("")
-    lines.append("- **现价**：crossback 当日收盘价")
-    lines.append("- **EMA10**：crossback 当日的 EMA(10)")
+    lines.append("- **触发收盘**：crossback 当日的真实收盘价（从行情缓存按该日 K 线取；"
+                 "`≈` 表示缓存里没那根 bar，用 EMA10×(1+上穿涨幅) 反推）")
+    lines.append("- **上穿 EMA10**：crossback 当日被上穿的 EMA(10) —— 不是收盘价")
     lines.append("- **上穿涨幅**：crossback 当日 close 相对 EMA10 的涨幅 (%)")
     lines.append("- **量比**：crossback 当日成交量 ÷ 过去 20 日均量")
     lines.append("- **强度**：1-5 ★（基于量能倍数）")
@@ -1099,16 +1146,18 @@ def generate_crossback_report(
     lines.append("## Crossback 信号（自信号日以来）")
     lines.append("")
     if records:
-        lines.append("| 日期 | 股票 | RS | 强度 | 现价 | 参考止损 | 量比 | 上穿 EMA10 | 上穿涨幅 |")
-        lines.append("|------|------|----|------|------|----------|------|-----------|---------|")
+        lines.append("| 日期 | 股票 | RS | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |")
+        lines.append("|------|------|----|------|----------|-----------|----------|------|---------|")
         for r in records:
             sections = _parse_reason(r.get("触发原因", ""))
             cb_text = sections.get("[EMA10回踩]", "")
             metrics = _parse_crossback_metrics(cb_text)
+            close_str = _crossback_close_str(
+                r.get("股票", ""), r.get("日期", ""), cache_dir, metrics["close_est"])
             lines.append(
                 f"| {r['日期']} | {r['股票']} | {_rs_rating_str(r)} | {r['强度星级']} "
-                f"| {metrics['close_str']} | {r.get('参考止损', '—')} "
-                f"| {metrics['vol_str']} | — | {metrics['pct_str']} |"
+                f"| {close_str} | {metrics['ema10_str']} | {r.get('参考止损', '—')} "
+                f"| {metrics['vol_str']} | {metrics['pct_str']} |"
             )
     else:
         lines.append("暂无 crossback 信号。")

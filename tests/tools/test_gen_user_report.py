@@ -434,3 +434,140 @@ def test_stage_cell_keeps_stage_3_and_4_marks():
     assert "🔴" in _format_stage_cell(_sr(4, "4"))
     assert _format_stage_cell(_sr(None)) == "—"
 
+
+# --------------------------------------------------------------------------
+# 回踩表：触发收盘 / 上穿EMA10 必须分清
+# --------------------------------------------------------------------------
+def _md_table(section: str) -> tuple[list[str], list[dict[str, str]]]:
+    """把一段 Markdown 里的第一张表拆成 (表头, 行字典列表)。"""
+    lines = [ln for ln in section.splitlines() if ln.startswith("|")]
+    if len(lines) < 2:
+        return [], []
+    header = [c.strip() for c in lines[0].strip().strip("|").split("|")]
+    rows: list[dict[str, str]] = []
+    for ln in lines[2:]:
+        cells = [c.strip().replace("**", "") for c in ln.strip().strip("|").split("|")]
+        if len(cells) == len(header):
+            rows.append(dict(zip(header, cells)))
+    return header, rows
+
+
+def _append_crossback(env: dict, date: str, symbol: str = "TEST") -> None:
+    """往 signals.csv 里塞一条 crossback 记录。"""
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.append({
+        "日期": date, "股票": symbol, "信号": "买入", "信号类型": "crossback_buy",
+        "强度(1-5)": "4", "参考止损": "$16.33",
+        "触发原因": "[EMA10回踩] 上穿EMA10($17.20, +1.5%) + 量能2.0x均量",
+        "RS相对强度": "53", "RS/SPY": "0.27", "RS-10W": "1.13", "RS-10D": "1.07",
+        "板块排名": "273/664",
+    })
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def test_crossback_close_column_is_true_close_not_ema10(env):
+    """「触发收盘」必须是回踩**当天**的真实收盘价。
+
+    `上穿EMA10($17.20, +1.5%)` 里的 $17.20 是 **EMA10**，不是收盘价。
+    fixture 里 11-04 收盘 17.45、11-05 收盘 17.75、EMA10 17.20 —— 三个数都不一样，
+    报告必须把它们分到三个不同的列里（触发收盘 / 现价 / 上穿EMA10）。
+    """
+    _append_crossback(env, "2026-11-04")
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    section = md.split("### 过去 7 天 watchlist 回踩")[1].split("\n## ")[0]
+    header, rows = _md_table(section)
+    row = [r for r in rows if r.get("股票") == "TEST"]
+    assert row, f"历史回踩表里没有 TEST：\n{section}"
+    r = row[0]
+
+    assert "触发收盘" in header, f"表头缺「触发收盘」：{header}"
+    assert "上穿EMA10" in header, f"表头缺「上穿EMA10」：{header}"
+    assert r["触发收盘"] == "$17.45", f"触发收盘应是当天真实收盘 17.45（17.20 是 EMA10）：{r}"
+    assert r["上穿EMA10"] == "$17.20", f"上穿EMA10 列应是 EMA10 本身：{r}"
+    assert r["现价"] == "$17.75", f"现价应是最新收盘 17.75：{r}"
+
+
+def test_crossback_today_row_close_column(env):
+    """今日新增回踩那张表同样要分清「触发收盘 / 上穿EMA10 / 现价」。"""
+    _append_crossback(env, "2026-11-05")
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    section = md.split("### 今日新增")[1].split("###")[0]
+    header, rows = _md_table(section)
+    row = [r for r in rows if r.get("股票") == "TEST"]
+    assert row, f"今日新增表里没有 TEST：\n{section}"
+    r = row[0]
+    assert r["触发收盘"] == "$17.75", f"触发收盘应是当天真实收盘 17.75：{r}"
+    assert r["上穿EMA10"] == "$17.20", f"上穿EMA10 列应是 EMA10 本身：{r}"
+
+
+def test_spy_volume_label_follows_volume_ratio(env):
+    """量能标签要同时看**量比和方向** —— 缩量上涨写成「放量上涨」是报假数字。"""
+    df = pd.read_pickle(env["cache_dir"] / "SPY.pkl")
+    df.iloc[-1, df.columns.get_loc("close")] = 710.0     # 收涨
+    df.iloc[-1, df.columns.get_loc("volume")] = 50_000   # 量比 0.05x → 缩量
+    pd.to_pickle(df, env["cache_dir"] / "SPY.pkl")
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    assert "缩量上涨" in md, f"缩量上涨没标出来：\n{md}"
+    assert "放量上涨" not in md, f"缩量被标成放量上涨：\n{md}"
+
+
+
+def test_crossback_close_falls_back_to_derived_value(env):
+    """行情缓存里没有回踩那天的 bar → 用 EMA10×(1+涨幅) 反推，并标「≈」表示是估算值。
+
+    「—」比估算值更没用：上穿涨幅本来就是用 (close−EMA10)/EMA10 算出来的，
+    反推出来的收盘价精度只受涨幅四舍五入影响。
+    """
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.append({
+        "日期": "2026-11-05", "股票": "NOCACHE", "信号": "买入", "信号类型": "crossback_buy",
+        "强度(1-5)": "4", "参考止损": "$16.33",
+        "触发原因": "[EMA10回踩] 上穿EMA10($17.20, +1.5%) + 量能2.0x均量",
+        "RS相对强度": "53", "RS/SPY": "0.27", "RS-10W": "1.13", "RS-10D": "1.07",
+        "板块排名": "273/664",
+    })
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    section = md.split("### 今日新增")[1].split("###")[0]
+    header, rows = _md_table(section)
+    row = [r for r in rows if r.get("股票") == "NOCACHE"]
+    assert row, f"今日新增表里没有 NOCACHE：\n{section}"
+    r = row[0]
+    # 17.20 × (1 + 1.5%) = 17.458
+    assert r["触发收盘"] == "≈$17.46", f"取不到缓存时应给反推值并标 ≈：{r}"
+    assert r["上穿EMA10"] == "$17.20", f"上穿EMA10 列应是 EMA10 本身：{r}"
+
+
+def test_crossback_columns_are_documented(env):
+    """段 1.5 的列必须有说明 —— 尤其「触发收盘」和「上穿EMA10」必须写清是两个不同的数。"""
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    assert "**触发收盘**" in md, "字段说明里没有「触发收盘」条目"
+    assert "**上穿EMA10**" in md, "字段说明里没有「上穿EMA10」条目"
+    assert "不是收盘价" in md, "说明里没点明 EMA10 不是收盘价"

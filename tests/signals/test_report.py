@@ -486,3 +486,109 @@ def test_signal_detail_shows_current_weinstein_stage(tmp_path):
 
     assert "| 阶段 |" in content, "信号概览里没有「阶段」这一行"
     assert "Stage 2" in content, "稳步上涨的票应是 Stage 2"
+
+# --------------------------------------------------------------------------
+# 回踩表：触发收盘 ≠ 上穿 EMA10
+# --------------------------------------------------------------------------
+def _md_table(section: str) -> tuple[list[str], list[dict[str, str]]]:
+    """把一段 Markdown 里的第一张表拆成 (表头, 行字典列表)。"""
+    lines = [ln for ln in section.splitlines() if ln.startswith("|")]
+    if len(lines) < 2:
+        return [], []
+    header = [c.strip() for c in lines[0].strip().strip("|").split("|")]
+    rows: list[dict[str, str]] = []
+    for ln in lines[2:]:
+        cells = [c.strip().replace("**", "") for c in ln.strip().strip("|").split("|")]
+        if len(cells) == len(header):
+            rows.append(dict(zip(header, cells)))
+    return header, rows
+
+
+def _write_crossback_cache(cache_dir, symbol: str, bars: dict[str, float]) -> None:
+    import pandas as pd
+
+    idx = pd.DatetimeIndex(list(bars), tz="UTC")
+    pd.to_pickle(
+        pd.DataFrame({"close": list(bars.values())}, index=idx),
+        cache_dir / f"{symbol}.pkl",
+    )
+
+
+def test_crossback_report_shows_true_close_not_ema10(tmp_path):
+    """回踩报告必须把「触发收盘」和「上穿 EMA10」分成两列。
+
+    `上穿EMA10($1.18, +10.3%)` 里的 $1.18 是 **EMA10**，不是那天的收盘价。
+    真收盘（1.30）只能去行情缓存按日期取 —— 以前这一列印的是 EMA10，
+    「上穿 EMA10」那列反而恒为「—」。
+    """
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+    from signals.report import generate_crossback_report
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_crossback_cache(cache, "CYPH", {"2026-08-21": 1.05, "2026-08-24": 1.30})
+
+    records = [{
+        "日期": "2026-08-24", "股票": "CYPH", "信号": "买入", "信号类型": "crossback_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$1.05",
+        "触发原因": "[EMA10回踩] 上穿EMA10($1.18, +10.3%) + 量能2.5x均量 | [RS] RS/SPY=1.05x",
+    }]
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        path = generate_crossback_report(
+            records=records, watchlist={}, strategy_id="v_eps_v2",
+            today=datetime(2026, 8, 24, tzinfo=timezone.utc), cache_dir=cache,
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+    content = path.read_text(encoding="utf-8")
+    section = content.split("## Crossback 信号")[1]
+    header, rows = _md_table(section)
+    row = [r for r in rows if r.get("股票") == "CYPH"]
+    assert row, f"回踩表里没有 CYPH：\n{section}"
+    r = row[0]
+    assert "触发收盘" in header, f"表头缺「触发收盘」：{header}"
+    assert r["触发收盘"] == "$1.30", f"触发收盘应是当天真实收盘 1.30（1.18 是 EMA10）：{r}"
+    assert r["上穿 EMA10"] == "$1.18", f"上穿 EMA10 列应是 EMA10 本身：{r}"
+    assert r["上穿涨幅"] == "+10.3%", f"上穿涨幅没进表：{r}"
+
+
+def test_daily_report_crossback_section_shows_true_close(tmp_path):
+    """日报里的「EMA 10 Crossback 信号」区段同样要分清收盘价和 EMA10。"""
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+    from signals.report import generate_daily_report
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_crossback_cache(cache, "CYPH", {"2026-08-21": 1.05, "2026-08-24": 1.30})
+
+    records = [{
+        "日期": "2026-08-24", "股票": "CYPH", "信号": "买入", "信号类型": "crossback_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$1.05",
+        "触发原因": "[EMA10回踩] 上穿EMA10($1.18, +10.3%) + 量能2.5x均量 | [RS] RS/SPY=1.05x",
+    }]
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        path = generate_daily_report(
+            today_records=[], strategy_id="v_eps_v2", strategy_name="Weinstein + EPS",
+            crossback_records=records, watchlist_status={}, cache_dir=cache,
+            today=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+    content = path.read_text(encoding="utf-8")
+    section = content.split("## EMA 10 Crossback 信号")[1]
+    header, rows = _md_table(section)
+    row = [r for r in rows if r.get("股票") == "CYPH"]
+    assert row, f"回踩区段里没有 CYPH：\n{section}"
+    r = row[0]
+    assert r["触发收盘"] == "$1.30", f"触发收盘应是当天真实收盘 1.30：{r}"
+    assert r["上穿 EMA10"] == "$1.18", f"上穿 EMA10 列应是 EMA10 本身：{r}"
