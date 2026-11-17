@@ -546,7 +546,7 @@ def test_crossback_report_shows_true_close_not_ema10(tmp_path):
         report_mod.OUTPUT_DIR = original
 
     content = path.read_text(encoding="utf-8")
-    section = content.split("## Crossback 信号")[1]
+    section = content.split("## 第二层：Crossback 信号")[1]
     header, rows = _md_table(section)
     row = [r for r in rows if r.get("股票") == "CYPH"]
     assert row, f"回踩表里没有 CYPH：\n{section}"
@@ -585,10 +585,111 @@ def test_daily_report_crossback_section_shows_true_close(tmp_path):
         report_mod.OUTPUT_DIR = original
 
     content = path.read_text(encoding="utf-8")
-    section = content.split("## EMA 10 Crossback 信号")[1]
+    section = content.split("## 第二层：EMA 10 Crossback 信号")[1]
     header, rows = _md_table(section)
     row = [r for r in rows if r.get("股票") == "CYPH"]
     assert row, f"回踩区段里没有 CYPH：\n{section}"
     r = row[0]
     assert r["触发收盘"] == "$1.30", f"触发收盘应是当天真实收盘 1.30：{r}"
     assert r["上穿 EMA10"] == "$1.18", f"上穿 EMA10 列应是 EMA10 本身：{r}"
+
+
+def test_daily_report_labels_layer_one_and_layer_two(tmp_path):
+    """日报必须显式区分第一层（主策略）和第二层（EMA10 回踩）。
+
+    用户策略本身就是两层结构：第一层 = v_eps_v2 主信号（Weinstein Stage 2 + EPS），
+    第二层 = watchlist EMA10 回踩（进场时机）。日报若不写清楚层级，
+    用户无法判断某条信号属于哪一套协议。
+    """
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+    from signals.report import generate_daily_report
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_crossback_cache(cache, "CYPH", {"2026-08-21": 1.05, "2026-08-24": 1.30})
+
+    today_records = [{
+        "日期": "2026-08-24", "股票": "TEST", "信号": "买入", "信号类型": "v_eps_v2_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$1.00",
+        "触发原因": "[EPS] 最新季度EPS$1.43",
+    }]
+    crossback_records = [{
+        "日期": "2026-08-24", "股票": "CYPH", "信号": "买入", "信号类型": "crossback_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$1.05",
+        "触发原因": "[EMA10回踩] 上穿EMA10($1.18, +10.3%) + 量能2.5x均量",
+    }]
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        path = generate_daily_report(
+            today_records=today_records, strategy_id="v_eps_v2", strategy_name="Weinstein + EPS",
+            crossback_records=crossback_records, watchlist_status={}, cache_dir=cache,
+            today=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+    content = path.read_text(encoding="utf-8")
+    assert "第一层" in content, "日报没有标注第一层（主策略）"
+    assert "第二层" in content, "日报没有标注第二层（EMA10 回踩）"
+    # 第一层区段必须排在第二层之前
+    assert content.index("第一层") < content.index("第二层"), "第一层应排在第二层之前"
+
+
+def test_crossback_tables_carry_full_rs_columns(tmp_path):
+    """第二层的两张回踩表必须带齐 RS 四列 + 板块排名。
+
+    第一层的表有 RS / RS/SPY / 10W / 10D / 板块排名，第二层以前只有一个 RS Rating，
+    用户看不到「这只票在板块里排第几」「是不是跑赢大盘」。
+    """
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+    from signals.report import generate_crossback_report, generate_daily_report
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_crossback_cache(cache, "CYPH", {"2026-08-21": 1.05, "2026-08-24": 1.30})
+
+    records = [{
+        "日期": "2026-08-24", "股票": "CYPH", "信号": "买入", "信号类型": "crossback_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$1.05",
+        "触发原因": "[EMA10回踩] 上穿EMA10($1.18, +10.3%) + 量能2.5x均量 | "
+                    "[RS] RS/SPY=1.05x / RS-10W=1.20x / RS-10D=0.90x / RS-Rating=88 "
+                    "(Information Technology 排名42/664)",
+        "RS相对强度": "88", "RS/SPY": "1.05", "RS-10W": "1.20", "RS-10D": "0.90",
+        "板块排名": "42/664",
+    }]
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        xb_path = generate_crossback_report(
+            records=records, watchlist={}, strategy_id="v_eps_v2",
+            today=datetime(2026, 8, 24, tzinfo=timezone.utc), cache_dir=cache,
+        )
+        daily_path = generate_daily_report(
+            today_records=[], strategy_id="v_eps_v2", strategy_name="Weinstein + EPS",
+            crossback_records=records, watchlist_status={}, cache_dir=cache,
+            today=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+    for path, label, marker in (
+        (xb_path, "回踩报告", "## 第二层：Crossback 信号"),
+        (daily_path, "日报区段", "## 第二层：EMA 10 Crossback 信号"),
+    ):
+        content = path.read_text(encoding="utf-8")
+        assert marker in content, f"{label} 缺区段标题"
+        section = content.split(marker)[1]
+        header, rows = _md_table(section)
+        row = [r for r in rows if r.get("股票") == "CYPH"]
+        assert row, f"{label} 里没有 CYPH"
+        r = row[0]
+        assert r.get("RS") == "88", f"{label} 缺 RS Rating：{header}"
+        assert r.get("RS/SPY") == "1.05x", f"{label} 缺 RS/SPY：{header}"
+        assert r.get("10W") == "1.20x", f"{label} 缺 10W：{header}"
+        assert r.get("10D") == "0.90x", f"{label} 缺 10D：{header}"
+        assert r.get("板块排名") == "42/664", f"{label} 缺板块排名：{header}"

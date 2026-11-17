@@ -58,7 +58,9 @@ def test_get_df_for_symbol_returns_none_when_missing(tmp_path: Path):
 def test_run_returns_signal_event_for_crossback(tmp_path: Path):
     """run_ema_crossback_strategy should emit SignalEvent when crossback detected."""
     signal_date_str = "2026-07-15"
-    today = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    # 第二层协议有「新鲜度」闸门（穿回日距今 ≤ 7 天）→ today 必须落在穿回日附近，
+    # 否则事件会被协议挡掉，测的就不是编排逻辑而是闸门了。
+    today = datetime(2026, 8, 13, tzinfo=timezone.utc)   # 穿回日 2026-08-10 + 3 天
     watchlist = {
         "CRDL": {
             "symbol": "CRDL",
@@ -116,7 +118,7 @@ def test_run_skips_watchlist_with_no_data(tmp_path: Path):
 
 def test_run_updates_watchlist_crossback_count(tmp_path: Path):
     """After detecting, run_ema_crossback_strategy should update watchlist crossback_count."""
-    today = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    today = datetime(2026, 8, 13, tzinfo=timezone.utc)   # 穿回日 2026-08-10 + 3 天（新鲜度窗口内）
     watchlist = {
         "CRDL": {
             "symbol": "CRDL",

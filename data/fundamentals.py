@@ -50,6 +50,32 @@ def _eps_cache_path(symbol: str) -> Path:
     return CACHE_DIR / f"eps_{symbol}.pkl"
 
 
+def format_eps_value(value) -> str:
+    """把 EPS 数值格式化成显示串。
+
+    - 普通金额：2 位小数（$1.00）
+    - 小于 1 分：保留有效位（$0.0025）—— 抹成 "$0.00" 会让「EPS 为正」的
+      判断失效（2026-11-17 实测：KVYO 实际 EPS $0.0025，报告显示 $0.00，
+      仓位档位规则 `(eps or 0) > 0` 判成「不是正数」→ 拿不到标准仓）
+    - 恰好 0：$0.00（不是 N/A —— N/A 会被误读成「取数失败」）
+    - 完全没有数据：N/A
+    """
+    if value is None:
+        return "N/A"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if v == 0:
+        return "$0.00"
+    if abs(v) >= 0.01:
+        return f"${v:.2f}"
+    text = f"{v:.6f}".rstrip("0").rstrip(".")
+    if text in ("", "0", "-0"):
+        return f"${v:.8f}"
+    return f"${text}"
+
+
 def _is_cache_valid(path: Path) -> bool:
     """检查缓存是否存在且未过期。
 
@@ -442,9 +468,10 @@ def check_eps_filter(
     if not result['has_data']:
         return False, f"EPS数据不足({result['quarters']}季度)"
 
-    latest = result.get('latest_eps') or 0
+    latest_raw = result.get('latest_eps')
+    latest = latest_raw or 0
     eps_negative = latest < 0
-    eps_str = f"${latest:.2f}" if latest else "N/A"
+    eps_str = format_eps_value(latest_raw)
 
     def _growth_phrase(rate, base_word, fail, eps_negative=False):
         """生成「比去年同期高 X.X%」类短语；rate=None 时只说方向。

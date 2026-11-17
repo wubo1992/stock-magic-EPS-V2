@@ -56,11 +56,15 @@ def test_detect_crossback_breakdown_no_recovery_returns_empty():
 
 
 def test_detect_crossback_breakdown_then_recovery_no_volume_no_signal():
-    """When price recovers but volume < 1.5x avg, no signal."""
+    """When price recovers but volume < 1.0x avg, no signal.
+
+    第二层协议的放量门槛是 1.0×（母项目口径）：量比 < 1.0 视为缩量，不算「放量穿回」。
+    """
     closes = list(np.linspace(10, 20, 40)) + [10] * 5 + list(np.linspace(10.5, 12, 15))
-    # All volumes uniform → ratio = 1.0
-    df = _make_df(closes, volumes=[1_000_000] * 60)
-    signals = detect_crossback(df, signal_date=df.index[0])
+    # 恢复区间的量整体缩到 0.9×（均量也一起缩，量比仍 < 1.0）→ 不发信号
+    vols = [1_000_000] * 45 + [900_000] * 15
+    df = _make_df(closes, volumes=vols)
+    signals = detect_crossback(df, signal_date=df.index[0], vol_mult=1.0)
     assert signals == []
 
 

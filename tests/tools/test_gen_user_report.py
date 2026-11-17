@@ -152,7 +152,7 @@ def test_report_has_all_required_sections(env):
         cache_dir=env["cache_dir"], universe_path=env["universe"],
     )
     for heading in (
-        "今日概览", "段 1：", "段 1.5：", "段 2：", "段 3：",
+        "今日概览", "段 1（**第一层**）", "段 1.5（**第二层**）", "段 2：", "段 3：",
         "监控池状态", "数据 caveat", "风险提示",
     ):
         assert heading in md, f"报告缺少段落：{heading}"
@@ -243,6 +243,37 @@ def test_missing_cache_symbol_does_not_crash(env):
         cache_dir=env["cache_dir"], universe_path=env["universe"],
     )
     assert "DEAD" in md  # 有缓存的 DEAD 进表；无缓存的走缺失分支也不崩
+
+
+def test_caveat_explains_layer2_history_rows_use_old_protocol(env):
+    """段 1.5 的历史回踩行必须在 caveat 里说明它跟当前协议口径不同。
+
+    第二层协议加了「当前仍站回 EMA10 上方」这一条 —— 一只票回踩当天成立、
+    但之后又跌回 EMA10 下方，它就**不再是当前信号**了。
+    历史行仍留在 signals.csv 里（那是当时的事实），若不说明口径，
+    用户会把「已经跌回去的票」误当成今天的进场依据。
+    """
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.append({
+        "日期": "2026-11-03", "股票": "FALLEN", "信号": "买入", "信号类型": "crossback_buy",
+        "强度(1-5)": "2", "参考止损": "$9.00",
+        "触发原因": "[EMA10回踩] 上穿EMA10($10.00, +2.0%) + 量能1.2x均量",
+        "RS相对强度": "53", "RS/SPY": "0.27", "RS-10W": "1.13", "RS-10D": "1.07",
+        "板块排名": "273/664",
+    })
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    caveat_section = md.split("数据 caveat")[1]
+    assert "EMA10" in caveat_section, "caveat 没提 EMA10 口径差异"
+    assert "站回" in caveat_section, "caveat 没说明「当前仍站回 EMA10 上方」这条条件"
 
 
 def test_crossback_on_session_day_is_todays_new_crossback(env):
@@ -571,3 +602,142 @@ def test_crossback_columns_are_documented(env):
     assert "**触发收盘**" in md, "字段说明里没有「触发收盘」条目"
     assert "**上穿EMA10**" in md, "字段说明里没有「上穿EMA10」条目"
     assert "不是收盘价" in md, "说明里没点明 EMA10 不是收盘价"
+
+
+def test_layer2_tables_carry_full_rs_columns(env):
+    """段 1.5 的两张回踩表必须带齐 RS 四列 + 板块 + 板块排名。
+
+    第二层信号同样是「可执行的进场依据」，缺 RS 就没法判断这只票
+    是不是市场里的强者；缺板块排名就看不出它在板块里排第几。
+    signals.csv 里这些字段本来就有，是表格没渲染出来。
+    """
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    # 数据日（2026-11-05）那条进「今日新增」，更早那条进「过去 7 天」
+    for date in ("2026-11-05", "2026-11-03"):
+        rows.append({
+            "日期": date, "股票": "TEST", "信号": "买入", "信号类型": "crossback_buy",
+            "强度(1-5)": "4", "参考止损": "$16.33",
+            "触发原因": "[EMA10回踩] 上穿EMA10($17.20, +1.5%) + 量能2.0x均量",
+            "RS相对强度": "53", "RS/SPY": "0.27", "RS-10W": "1.13", "RS-10D": "1.07",
+            "板块排名": "273/664",
+        })
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    for heading in ("### 今日新增（回踩日", "### 过去 7 天 watchlist 回踩"):
+        assert heading in md, f"报告缺区段：{heading}"
+        section = md.split(heading)[1].split("\n## ")[0]
+        for col in ("RS", "RS/SPY", "10W", "10D", "板块", "板块排名"):
+            assert f"| {col}" in section or f"| **{col}**" in section, \
+                f"{heading} 缺「{col}」列：\n{section}"
+        # RS 数值必须真的出现在表里，不能是空占位
+        assert "53" in section, f"{heading} 里 RS Rating 没渲染：\n{section}"
+        assert "273/664" in section, f"{heading} 里板块排名没渲染：\n{section}"
+
+
+def test_layer2_glossary_documents_the_new_columns(env):
+    """段 1.5 的字段说明必须覆盖新加的 RS 列。"""
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.append({
+        "日期": "2026-11-05", "股票": "TEST", "信号": "买入", "信号类型": "crossback_buy",
+        "强度(1-5)": "4", "参考止损": "$16.33",
+        "触发原因": "[EMA10回踩] 上穿EMA10($17.20, +1.5%) + 量能2.0x均量",
+        "RS相对强度": "53", "RS/SPY": "0.27", "RS-10W": "1.13", "RS-10D": "1.07",
+        "板块排名": "273/664",
+    })
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    glossary = md.split("段 1.5 字段说明")[1].split("\n## ")[0]
+    for name in ("RS", "RS/SPY", "10W", "10D", "板块排名"):
+        assert f"**{name}**" in glossary, f"段 1.5 字段说明缺「{name}」：\n{glossary}"
+
+
+# --------------------------------------------------------------------------
+# EPS 小额精度：$0.0025 不能被抹成 $0.00
+# --------------------------------------------------------------------------
+def test_eps_money_keeps_sub_cent_precision():
+    """小于 1 分的 EPS 要保留有效位 —— 抹成 $0.00 会让「EPS 为正」判不出来。"""
+    from tools.gen_user_report import _eps_money
+    assert _eps_money(0.0025) == "$0.0025"
+    assert _eps_money(1.0) == "$1.00"
+    assert _eps_money(-0.13) == "$-0.13"
+    assert _eps_money(0.0) == "$0.00"
+    assert _eps_money(None) == "—"
+
+
+def test_tiny_eps_is_recovered_from_cache_and_gets_standard_position(env):
+    """触发原因里的 EPS 被抹成 $0.00 时，报告要能自己修回来。
+
+    2026-11-17 实测：KVYO 最新季度 EPS = $0.0025（从 −$0.0298 转正），
+    触发原因写成「最新季度EPS$0.00」→ 仓位档位规则 `(eps or 0) > 0` 判成
+    「不是正数」→ 即使 RS ≥85 也拿不到标准仓。
+    """
+    import pickle
+    quarters = [
+        ("2026-Q3", 0.0025), ("2026-Q2", -0.0298), ("2026-Q1", 0.0296),
+        ("2025-Q4", 0.0232), ("2025-Q3", -0.0014), ("2025-Q2", -0.0852),
+        ("2025-Q1", -0.0514), ("2024-Q4", -0.0996),
+    ]
+    (env["cache_dir"] / "eps_TEST.pkl").write_bytes(pickle.dumps({"eps_history": quarters}))
+
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows[0]["触发原因"] = rows[0]["触发原因"].replace("最新季度EPS$2.10", "最新季度EPS$0.00")
+    rows[0]["RS相对强度"] = "90"
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    row = _main_row(md)
+    assert "$0.0025" in row, f"小额正 EPS 被抹成 0：{row}"
+    assert not re.search(r"\*\*\$0\.00\*\*", row), f"小额正 EPS 被抹成 0：{row}"
+
+    grade_rows = [ln for ln in md.splitlines() if ln.startswith("| ⭐⭐⭐ |")]
+    assert any("TEST" in ln for ln in grade_rows), \
+        f"RS 90 + EPS 为正 → 应给标准仓（⭐⭐⭐）：\n{md}"
+
+
+def test_historical_rows_keep_their_own_eps_text(env):
+    """历史行不拿今天的 EPS 去覆盖 —— 那是拿今天的数据伪造归档。
+
+    只有报告当天（date_str）的行才允许回退到本地 EPS 缓存。
+    """
+    import pickle
+    quarters = [("2026-Q3", 0.0025)] + [(f"2026-Q{i}", 0.1) for i in (2, 1)]
+    (env["cache_dir"] / "eps_TEST.pkl").write_bytes(pickle.dumps({"eps_history": quarters}))
+
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows[0]["日期"] = "2026-11-02"      # 历史行
+    rows[0]["触发原因"] = rows[0]["触发原因"].replace("最新季度EPS$2.10", "最新季度EPS$0.00")
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"], watchlist_path=env["watchlist"],
+        cache_dir=env["cache_dir"], universe_path=env["universe"],
+    )
+    history = md.split("过去 7 天")[1] if "过去 7 天" in md else md
+    assert "$0.0025" not in history, f"历史行被今天的 EPS 覆盖了：\n{history}"

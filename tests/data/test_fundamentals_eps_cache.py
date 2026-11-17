@@ -100,3 +100,75 @@ def test_expired_cache_falls_back_to_stale_data_when_refresh_fails(eps_env):
 
     assert result["latest_eps"] == pytest.approx(quarters[0][1])
     assert result["quarters"] == 10
+
+
+def test_tiny_positive_eps_keeps_precision_in_reason(eps_env):
+    """EPS $0.0025 不能被写成 "$0.00" —— 报告的「EPS 为正」门槛读的就是这个串。
+
+    2026-11-17 实测：KVYO 最新季度 EPS = $0.0025（从 −$0.0298 转正），
+    触发原因写成「最新季度EPS$0.00」→ 仓位档位规则 `(eps or 0) > 0` 判成
+    「不是正数」→ 即使 RS ≥85 也拿不到标准仓；报告显示的 EPS 也是 $0.00，
+    读者以为它没赚钱。
+    """
+    f, tmp_path = eps_env
+    quarters = [
+        ("2026-Q3", 0.0025),    # 最新季度：微利
+        ("2026-Q2", -0.0298),
+        ("2026-Q1", 0.0296),
+        ("2025-Q4", 0.0232),
+        ("2025-Q3", -0.0014),   # 去年同期（基数接近 0 → 同比百分比虚高）
+        ("2025-Q2", -0.0852),
+        ("2025-Q1", -0.0514),
+        ("2024-Q4", -0.0996),
+    ]
+    _write_cache(tmp_path / "eps_TEST.pkl", quarters)
+
+    _passed, reason = f.check_eps_filter("TEST", quarters=2)
+
+    assert "最新季度EPS$0.00，" not in reason, f"小额正 EPS 被抹成 0：{reason}"
+
+    import re
+    m = re.search(r"最新季度EPS\$(-?[\d.]+)", reason)
+    assert m, f"触发原因里找不到 EPS：{reason}"
+    assert float(m.group(1)) == pytest.approx(0.0025)
+
+
+def test_normal_eps_string_is_unchanged(eps_env):
+    """正常金额仍按 2 位小数写 —— 不能为了 KVYO 一只票把所有行的 EPS 都改格式。"""
+    f, tmp_path = eps_env
+    quarters = [
+        ("2026-Q3", 1.00),
+        ("2026-Q2", 0.53),
+        ("2026-Q1", 0.31),
+        ("2025-Q4", 0.29),
+        ("2025-Q3", 0.28),
+        ("2025-Q2", 0.20),
+        ("2025-Q1", 0.10),
+        ("2024-Q4", 0.05),
+    ]
+    _write_cache(tmp_path / "eps_TEST.pkl", quarters)
+
+    _passed, reason = f.check_eps_filter("TEST", quarters=2)
+
+    assert "最新季度EPS$1.00，" in reason, reason
+
+
+def test_zero_eps_is_not_written_as_n_a(eps_env):
+    """EPS 恰好为 0 不是「没有数据」—— 写成 N/A 会让人以为是取数失败。"""
+    f, tmp_path = eps_env
+    quarters = [
+        ("2026-Q3", 0.0),
+        ("2026-Q2", -0.0298),
+        ("2026-Q1", 0.0296),
+        ("2025-Q4", 0.0232),
+        ("2025-Q3", -0.0014),
+        ("2025-Q2", -0.0852),
+        ("2025-Q1", -0.0514),
+        ("2024-Q4", -0.0996),
+    ]
+    _write_cache(tmp_path / "eps_TEST.pkl", quarters)
+
+    _passed, reason = f.check_eps_filter("TEST", quarters=2)
+
+    assert "N/A" not in reason, reason
+    assert "最新季度EPS$0.00，" in reason, reason

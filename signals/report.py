@@ -454,25 +454,78 @@ def _build_watchlist_crossback_section(watchlist: dict, today: datetime) -> str:
     return "\n".join(lines)
 
 
+def _latest_record_date(records: list[dict]):
+    """记录里最晚的日期 —— crossback 事件按**数据日**标注，不是运行日。"""
+    dates = []
+    for r in records:
+        try:
+            dates.append(datetime.strptime(r.get("日期", ""), "%Y-%m-%d").date())
+        except (ValueError, TypeError):
+            continue
+    return max(dates) if dates else None
+
+
+def _trading_days_since(date_str: str, base_date) -> str:
+    """距今多少个**交易日**（按 5/7 近似估算，最小 1）。
+
+    与 watchlist 状态表里的「距今」口径保持一致。
+    """
+    if not date_str or base_date is None:
+        return "—"
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return "—"
+    delta = (base_date - d).days
+    return f"{max(1, round(delta * 5 / 7))} 交易日"
+
+
+def _rs_mult_str(value: str) -> str:
+    """RS 倍数列的展示值：1.05 → 1.05x；缺失 → —。"""
+    v = (value or "").strip()
+    if not v or v == "—":
+        return "—"
+    return v if v.endswith("x") else f"{v}x"
+
+
+def _crossback_table(records: list[dict], cache_dir=None) -> list[str]:
+    """第二层回踩表 —— 日报区段和独立回踩报告共用同一张表。
+
+    列与第一层对齐（RS 四列 + 板块排名）：回踩票同样是可执行的进场依据，
+    只给一个 RS Rating 看不出它在板块里排第几、是不是跑赢大盘。
+    """
+    lines = [
+        "| 日期 | 距今 | 股票 | RS | RS/SPY | 10W | 10D | 板块排名 | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |",
+        "|------|------|------|----|--------|-----|-----|---------|------|----------|-----------|----------|------|---------|",
+    ]
+    base_date = _latest_record_date(records)
+    for r in records:
+        sections = _parse_reason(r.get("触发原因", ""))
+        cb_text = sections.get("[EMA10回踩]", "")
+        metrics = _parse_crossback_metrics(cb_text)
+        close_str = _crossback_close_str(
+            r.get("股票", ""), r.get("日期", ""), cache_dir, metrics["close_est"])
+        rs = _rs_columns(r)
+        lines.append(
+            f"| {r['日期']} | {_trading_days_since(r['日期'], base_date)} "
+            f"| {r['股票']} | {rs.get('RS相对强度') or '—'} "
+            f"| {_rs_mult_str(rs.get('RS/SPY'))} | {_rs_mult_str(rs.get('RS-10W'))} "
+            f"| {_rs_mult_str(rs.get('RS-10D'))} | {rs.get('板块排名') or '—'} "
+            f"| {r['强度星级']} "
+            f"| {close_str} | {metrics['ema10_str']} | {r.get('参考止损', '—')} "
+            f"| {metrics['vol_str']} | {metrics['pct_str']} |"
+        )
+    return lines
+
+
 def _build_crossback_section(crossback_records: list[dict], watchlist_status: dict,
                               cache_dir=None) -> str:
-    """生成 EMA 10 Crossback 区段 Markdown（spec §4.3）。"""
-    lines = ["", "---", "", "## EMA 10 Crossback 信号（自信号日以来）", ""]
+    """生成第二层（EMA 10 回踩）区段 Markdown（spec §4.3）。"""
+    lines = ["", "---", "",
+             "## 第二层：EMA 10 Crossback 信号（观察清单回踩 · 进场时机）", ""]
 
     if crossback_records:
-        lines.append("| 日期 | 股票 | RS | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |")
-        lines.append("|------|------|----|------|----------|-----------|----------|------|---------|")
-        for r in crossback_records:
-            sections = _parse_reason(r.get("触发原因", ""))
-            cb_text = sections.get("[EMA10回踩]", "")
-            metrics = _parse_crossback_metrics(cb_text)
-            close_str = _crossback_close_str(
-                r.get("股票", ""), r.get("日期", ""), cache_dir, metrics["close_est"])
-            lines.append(
-                f"| {r['日期']} | {r['股票']} | {_rs_rating_str(r)} | {r['强度星级']} "
-                f"| {close_str} | {metrics['ema10_str']} | {r.get('参考止损', '—')} "
-                f"| {metrics['vol_str']} | {metrics['pct_str']} |"
-            )
+        lines += _crossback_table(crossback_records, cache_dir)
     else:
         lines.append("暂无 crossback 信号。")
     lines.append("")
@@ -482,11 +535,18 @@ def _build_crossback_section(crossback_records: list[dict], watchlist_status: di
         lines.append("")
         lines.append(f"- 当前监控：**{watchlist_status.get('total', 0)}** 只")
         lines.append(f"- 今日新增：**{watchlist_status.get('added_today', 0)}** 只（来自 v_eps_v2_buy）")
-        lines.append(f"- 今日触发 crossback：**{watchlist_status.get('triggered_today', 0)}** 只")
-        if watchlist_status.get("triggered_cumulative"):
+        data_day = watchlist_status.get("data_day")
+        if data_day:
             lines.append(
-                f"- 累计触发 crossback（自信号日以来，去重）："
-                f"**{watchlist_status.get('triggered_cumulative', 0)}** 只"
+                f"- 最新交易日触发 crossback（数据日 {data_day}）："
+                f"**{watchlist_status.get('triggered_today', 0)}** 只"
+            )
+        else:
+            lines.append(f"- 今日触发 crossback：**{watchlist_status.get('triggered_today', 0)}** 只")
+        if watchlist_status.get("triggered_recent"):
+            lines.append(
+                f"- 新鲜度窗口内触发 crossback（≤{watchlist_status.get('freshness_days', 7)} 天，去重）："
+                f"**{watchlist_status.get('triggered_recent', 0)}** 只"
             )
         lines.append("")
 
@@ -522,19 +582,22 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
         "",
         "---",
         "",
+        "> **报告分两层**：**第一层** = v_eps_v2 主策略（Weinstein Stage 2 + EPS 突破）；",
+        "> **第二层** = watchlist EMA10 回踩（进场时机协议），见文末区段。",
+        "",
     ]
 
     # ── 今日新增信号 ───────────────────────────────────────
     # records 里混着 crossback pipeline 吐出的**全部历史 crossback**（自信号日以来累积），
     # 不按日期过滤的话 2026-09-29 的信号会被标成「🆕 今日新增 / 明日开盘买入」。
-    # crossback 记录在报告末尾的「EMA 10 Crossback 信号」区段里另有完整展示。
+    # crossback 记录在报告末尾的「第二层：EMA 10 Crossback 信号」区段里另有完整展示。
     today_only   = [r for r in today_records if r.get("日期") == today_str]
     today_buys  = [r for r in today_only if r.get("信号") == "买入"]
     today_sells = [r for r in today_only if r.get("信号") == "卖出"]
 
     if not today_only:
         lines += [
-            "## 今日新增信号",
+            "## 第一层：今日新增信号",
             "",
             "> 今日无新信号。SEPA 条件严格，无信号是正常状态，代表当前市场没有",
             "> 同时满足趋势模板 + VCP 形态 + 突破 + 量能四重条件的股票。",
@@ -543,7 +606,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
     else:
         if today_buys:
             lines += [
-                "## 今日新增买入信号",
+                "## 第一层：今日新增买入信号",
                 "",
             ]
             for r in sorted(today_buys, key=lambda x: -_safe_int(x.get("强度(1-5)", 0))):
@@ -553,7 +616,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
 
         if today_sells:
             lines += [
-                "## 今日出场信号",
+                "## 第一层：今日出场信号",
                 "",
             ]
             for r in today_sells:
@@ -564,7 +627,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
 
     # ── 过去7天汇总表 ──────────────────────────────────────
     lines += [
-        "## 过去 7 天信号汇总",
+        "## 第一层：过去 7 天信号汇总",
         "",
     ]
 
@@ -619,7 +682,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
     past_buys = [r for r in buys_7d if r.get("日期") != today_str]
     if past_buys:
         lines += [
-            "## 过去 7 天买入信号详细解读",
+            "## 第一层：过去 7 天买入信号详细解读",
             "",
             "> 以下是本周内（不含今日）触发的买入信号的完整条件解读，",
             "> 供复盘和学习参考。",
@@ -1143,22 +1206,10 @@ def generate_crossback_report(
     lines.append("- **RS**：O'Neil RS Rating（全市场加权收益百分位 1-99，越高越强；"
                  "80 以上属 CAN SLIM 的合格区间）")
     lines.append("")
-    lines.append("## Crossback 信号（自信号日以来）")
+    lines.append("## 第二层：Crossback 信号（观察清单回踩 · 进场时机）")
     lines.append("")
     if records:
-        lines.append("| 日期 | 股票 | RS | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |")
-        lines.append("|------|------|----|------|----------|-----------|----------|------|---------|")
-        for r in records:
-            sections = _parse_reason(r.get("触发原因", ""))
-            cb_text = sections.get("[EMA10回踩]", "")
-            metrics = _parse_crossback_metrics(cb_text)
-            close_str = _crossback_close_str(
-                r.get("股票", ""), r.get("日期", ""), cache_dir, metrics["close_est"])
-            lines.append(
-                f"| {r['日期']} | {r['股票']} | {_rs_rating_str(r)} | {r['强度星级']} "
-                f"| {close_str} | {metrics['ema10_str']} | {r.get('参考止损', '—')} "
-                f"| {metrics['vol_str']} | {metrics['pct_str']} |"
-            )
+        lines += _crossback_table(records, cache_dir)
     else:
         lines.append("暂无 crossback 信号。")
 
@@ -1172,15 +1223,21 @@ def generate_crossback_report(
     lines.append("## Watch List 状态汇总")
     lines.append("")
     lines.append(f"- 当前监控：**{len(watchlist)}** 只")
-    today_triggered = {r['股票'] for r in records if r.get('日期') == today_str}
+    # crossback 事件按**数据日**（它实际发生的那根 K 线日期）标注，不是运行日，
+    # 所以「今日触发」要拿「最新交易日」来比，不能拿运行日比。
+    data_day = _latest_record_date(records)
+    today_triggered = {r['股票'] for r in records if data_day and r.get('日期') == data_day.isoformat()}
     if today_triggered:
-        lines.append(f"- 今日触发 crossback：**{len(today_triggered)}** 只（{', '.join(sorted(today_triggered))}）")
+        lines.append(
+            f"- 最新交易日触发 crossback（数据日 {data_day.isoformat()}）："
+            f"**{len(today_triggered)}** 只（{', '.join(sorted(today_triggered))}）"
+        )
     else:
         lines.append(f"- 今日触发 crossback：**0** 只")
     if records:
         cumulative_symbols = {r['股票'] for r in records}
         lines.append(
-            f"- 累计触发 crossback（自信号日以来，去重）：**{len(cumulative_symbols)}** 只"
+            f"- 新鲜度窗口内触发 crossback（去重）：**{len(cumulative_symbols)}** 只"
             f"（{', '.join(sorted(cumulative_symbols))}）"
         )
     lines.append("")

@@ -179,13 +179,23 @@ scan:
   request_delay_seconds: 1.2
 
 # ------------------------------------------------------------
-# EMA 10 Crossback strategy (spec §7)
+# 第二层：EMA 10 Crossback / 观察清单回踩（spec §7）
+#
+# 四条件协议（与母项目「信号系统克劳德V3.1」对齐）：
+#   ① 自加入日起曾跌破 EMA10   —— 状态机隐含保证（必须先真的跌破过）
+#   ② 当前已站回 EMA10 上方     —— require_currently_above
+#   ③ 穿回日放量 ≥ volume_mult × 20日均量
+#   ④ 穿回日距今 ≤ max_days_since_crossback 天（新鲜度）
+#   硬排除：最近 split_guard_lookback 根 K 线内有 ≥8 倍机械跳空（反向拆股）
 # ------------------------------------------------------------
 ema_crossback:
   enabled: true                    # 总开关
   ema_period: 10                   # EMA 周期
-  volume_mult: 1.5                 # 量能倍数阈值（crossback 当日量 ÷ 20日均量）
+  volume_mult: 1.0                 # 量能倍数阈值（穿回当日量 ÷ 20日均量）；母项目口径 1.0×，改 1.5 更严
   volume_lookback: 20              # 量能回看天数
+  max_days_since_crossback: 7      # 新鲜度：穿回日距今 ≤ 7 天（超期视为过期，不发信号）
+  require_currently_above: true    # 条件②：当前仍站回 EMA10 上方
+  split_guard_lookback: 30         # 反向拆股（≥8 倍跳空）检查窗口，单位 = 根 K 线
   watchlist_expire_days: 60        # watch list 过期天数
   output:
     append_to_main_csv: true       # 是否追加到 signals.csv

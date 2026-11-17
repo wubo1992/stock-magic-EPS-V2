@@ -53,6 +53,11 @@ from strategies.ema_crossback import (
     prune_expired,
     run_ema_crossback_strategy,
 )
+from strategies.ema_crossback.ema_crossback_strategy import (
+    DEFAULT_MAX_DAYS_SINCE_CROSSBACK,
+    DEFAULT_SPLIT_GUARD_LOOKBACK,
+    DEFAULT_VOL_MULT,
+)
 from strategies.ema_crossback.watchlist import save_watchlist
 from strategies.registry import get_strategy
 from universe.manager import get_universe, _read_universe_md
@@ -223,17 +228,30 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
     )
     watchlist = prune_expired(watchlist, today)
 
-    # 3. 运行 crossback 策略
+    # 3. 运行 crossback 策略（第二层：观察清单 EMA10 回踩）
+    #    四条件协议：①曾跌破 ②当前已站回 ③放量 ≥volume_mult ④新鲜度 ≤max_days
+    #    另加反向拆股硬排除（≥8 倍机械跳空）
     crossback_events = []
+    _vol_mult = cb_cfg.get("volume_mult", DEFAULT_VOL_MULT)
+    _max_days = cb_cfg.get("max_days_since_crossback", DEFAULT_MAX_DAYS_SINCE_CROSSBACK)
     if cb_cfg.get("enabled", True):
+        print(
+            f"[第二层] EMA10 回踩协议：量比 ≥ {_vol_mult}×20日均量"
+            f" | 新鲜度 ≤ {_max_days} 天"
+            f" | 当前已站回 EMA10: {cb_cfg.get('require_currently_above', True)}"
+            " | 排反向拆股: 是"
+        )
         crossback_events = run_ema_crossback_strategy(
             watchlist,
             market_data=market_data,
             today=today,
             cache_dir=Path("data/cache"),
             ema_period=cb_cfg.get("ema_period", 10),
-            vol_mult=cb_cfg.get("volume_mult", 1.5),
+            vol_mult=_vol_mult,
             vol_lookback=cb_cfg.get("volume_lookback", 20),
+            max_days_since_crossback=_max_days,
+            require_currently_above=cb_cfg.get("require_currently_above", True),
+            split_guard_lookback=cb_cfg.get("split_guard_lookback", DEFAULT_SPLIT_GUARD_LOOKBACK),
         )
 
     # CRITICAL：必须无条件持久化 watchlist —— run_ema_crossback_strategy
@@ -251,12 +269,19 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
         print("\n今日无有效信号。")
         print("（SEPA 条件严格，无信号是正常的。有信号时才需要关注。）")
 
-    # 5. 生成报告（含 v_eps_v2 + crossback 两类）
-    # 今日触发按严格当日口径统计（避免把自信号日以来的累计 crossback 误报为今日触发）
-    _today_str = today.strftime("%Y-%m-%d")
+    # 5. 生成报告（含 v_eps_v2 第一层 + crossback 第二层）
+    #
+    # crossback 事件的时间戳是**数据日**（它实际发生的那根 K 线日期），不是运行日。
+    # 行情在美股收盘前跑时，数据的最后一天是上一个交易日 → 用运行日去比永远��� 0，
+    # 那是口径错误不是「今天没信号」。所以「今日触发」= 最新交易日触发。
+    _data_day = None
+    if crossback_events:
+        _data_day = max(e.timestamp for e in crossback_events).strftime("%Y-%m-%d")
+    elif market_data.get("SPY") is not None and len(market_data["SPY"]):
+        _data_day = market_data["SPY"].index[-1].strftime("%Y-%m-%d")
     _triggered_today = {
         e.symbol for e in crossback_events
-        if e.timestamp.strftime("%Y-%m-%d") == _today_str
+        if e.timestamp.strftime("%Y-%m-%d") == _data_day
     }
     recent_pnl = compute_recent_signal_pnl(watchlist, today, Path("data/cache"))
     report_path = generate_daily_report(
@@ -268,7 +293,9 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
             "total": len(watchlist),
             "added_today": len(new_entries),
             "triggered_today": len(_triggered_today),
-            "triggered_cumulative": len({e.symbol for e in crossback_events}),
+            "triggered_recent": len({e.symbol for e in crossback_events}),
+            "freshness_days": _max_days,
+            "data_day": _data_day,
             "recent_pnl": recent_pnl,
         },
         watchlist=watchlist,

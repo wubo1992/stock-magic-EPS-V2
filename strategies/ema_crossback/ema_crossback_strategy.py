@@ -1,5 +1,12 @@
 """
-strategies/ema_crossback/ema_crossback_strategy.py — EMA 10 crossback 检测
+strategies/ema_crossback/ema_crossback_strategy.py — EMA 10 crossback 检测（第二层）
+
+第二层协议（与母项目「信号系统克劳德V3.1」对齐，见 watchlist/analyzer.py）：
+    ① 自加入日起曾跌破 EMA10      —— 由状态机隐含保证（state 必须先变 below）
+    ② 当前已站回 EMA10 上方        —— require_currently_above
+    ③ 穿回日成交量 ≥ 1.0×20日均量  —— vol_mult（放量穿回；<1.0 视为缩量）
+    ④ 穿回日距今 ≤ 7 天            —— max_days_since_crossback（新鲜度过滤）
+    硬排除：最近 30 根 K 线内 ≥8 倍机械跳空（反向拆股）→ 假穿回，直接剔除
 
 核心算法（spec §6.1）：
 - 在 df[signal_date..today] 范围内扫描
@@ -15,7 +22,7 @@ strategies/ema_crossback/ema_crossback_strategy.py — EMA 10 crossback 检测
 3. fetch() 重新拉取
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +31,7 @@ import pandas as pd
 from data.daily_bars import dedup_daily_bars
 from data.fetcher import fetch
 from data.rs import compute_rs
+from data.split_guard import has_split_gap
 from events import SignalEvent
 from events.base import CROSSBACK_BUY_SIGNAL_TYPE
 
@@ -33,16 +41,28 @@ DEFAULT_CACHE_DIR = Path("data/cache")
 
 REASON_PREFIX_CROSSBACK = "[EMA10回踩]"
 
+# 第二层协议默认值（母项目口径）
+DEFAULT_VOL_MULT = 1.0                      # 放量穿回：量比 ≥ 1.0×20日均量
+DEFAULT_MAX_DAYS_SINCE_CROSSBACK = 7        # 新鲜度：穿回日距今 ≤ 7 天
+DEFAULT_SPLIT_GUARD_LOOKBACK = 30           # 反向拆股检查窗口（根 K 线）
+
 
 def detect_crossback(
     df: pd.DataFrame,
     signal_date: pd.Timestamp,
     ema_period: int = 10,
-    vol_mult: float = 1.5,
+    vol_mult: float = DEFAULT_VOL_MULT,
     vol_lookback: int = 20,
+    max_days_since_crossback: int | None = None,
+    require_currently_above: bool = False,
+    today: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """
     在 df[signal_date..today] 范围内检测 EMA crossback + 量能确认。
+
+    第二层协议的 ②④ 两个闸门在这里生效（① 由状态机隐含保证）：
+    - require_currently_above=True → 最新一根 bar 收盘价必须仍在 EMA10 上方
+    - max_days_since_crossback=N  → 穿回日距今天 ≤ N 天（None = 不做新鲜度过滤）
 
     Returns:
         list of dict: [{date, close, ema10, volume, avg_vol_20, volume_ratio, strength}]
@@ -70,11 +90,24 @@ def detect_crossback(
     if df.empty:
         return []
 
+    # 条件 ②：当前已站回 EMA10 上方。
+    # 上穿后又跌回 EMA10 下面 → 那次上穿已经作废，不再是「可行动」的进场时点。
+    if require_currently_above:
+        last_row = df.iloc[-1]
+        if not (last_row["close"] > last_row["ema10"]):
+            return []
+
     # Issue 3 修复：初值根据 signal_date 当日状态决定
-    first_row = df.iloc[0]
-    # "<=" so equal-to-EMA10 day counts as "below" (avoids spurious crossback on rounding ties).
-    # Loop body uses strict ">" so equal-day does NOT emit a signal.
-    state = "below" if first_row["close"] <= first_row["ema10"] else "above"
+    #
+    # 初值必须是 "above"：state 只能被**真的跌破**（close < ema10）改写成 "below"。
+    # 早期版本用 "<=" 把「收盘价恰好等于 EMA10」也算作跌破 —— 而 EMA10 的第一个值
+    # 恒等于第一个收盘价，于是任何「从 data 起点开始扫」的股票在第 2 根 bar 就会被
+    # 判成「上穿 EMA10」（这个假象原先被 1.5× 的量能门槛挡住，门槛放宽到 1.0× 后暴露）。
+    # 母项目的判据同样是严格的：below_mask = slice_close < slice_ema10。
+    #
+    # signal_date 当日若真的在 EMA10 下方，循环第 1 轮就会把 state 置成 "below"，
+    # Issue 3 的行为不变。
+    state = "above"
 
     signals = []
     for date, row in df.iterrows():
@@ -97,29 +130,45 @@ def detect_crossback(
                 })
             state = "above"
 
+    # 条件 ④：新鲜度过滤 —— 穿回日距今超过窗口视为过期
+    if max_days_since_crossback is not None and signals:
+        ref_date = _reference_date(df, today)
+        cutoff = ref_date - timedelta(days=max_days_since_crossback)
+        signals = [s for s in signals if s["date"].date() >= cutoff]
+
     return signals
+
+
+def _reference_date(df: pd.DataFrame, today: datetime | None) -> "datetime.date":
+    """新鲜度过滤的参照日：优先用传入的 today，否则用最后一根 bar 的日期。"""
+    if today is not None:
+        return today.date()
+    return df.index[-1].date()
 
 
 def _crossback_strength(vol_ratio: float) -> int:
     """
-    根据量能倍数计算强度等级（3-5）：
+    根据量能倍数计算强度等级（2-5）：
+    - 1.0 - 1.5x: ★★☆☆☆ (2)  弱放量
     - 1.5 - 2.0x: ★★★☆☆ (3)
     - 2.0 - 3.0x: ★★★★☆ (4)
     - >= 3.0x: ★★★★★ (5)
 
     Raises:
-        ValueError: 如果 vol_ratio < 1.5（caller 应在调用前过滤）
+        ValueError: 如果 vol_ratio < 1.0（caller 应在调用前过滤）
 
     Returns:
-        int: 强度等级 3-5
+        int: 强度等级 2-5
     """
-    if vol_ratio < 1.5:
-        raise ValueError(f"vol_ratio must be >= 1.5, got {vol_ratio}")
+    if vol_ratio < 1.0:
+        raise ValueError(f"vol_ratio must be >= 1.0, got {vol_ratio}")
     if vol_ratio >= 3.0:
         return 5
     if vol_ratio >= 2.0:
         return 4
-    return 3  # 1.5 <= vol_ratio < 2.0
+    if vol_ratio >= 1.5:
+        return 3
+    return 2  # 1.0 <= vol_ratio < 1.5
 
 
 def _get_df_for_symbol(
@@ -168,11 +217,20 @@ def run_ema_crossback_strategy(
     today: datetime | None = None,
     cache_dir: Path | None = None,
     ema_period: int = 10,
-    vol_mult: float = 1.5,
+    vol_mult: float = DEFAULT_VOL_MULT,
     vol_lookback: int = 20,
+    max_days_since_crossback: int | None = DEFAULT_MAX_DAYS_SINCE_CROSSBACK,
+    require_currently_above: bool = True,
+    split_guard_lookback: int = DEFAULT_SPLIT_GUARD_LOOKBACK,
 ) -> list[SignalEvent]:
     """
     遍历 watchlist，对每只股票检测 crossback（spec §6.1.1 + §6.2.4）。
+
+    第二层协议在这里完整生效：
+      ② require_currently_above —— 当前已站回 EMA10 上方
+      ③ vol_mult —— 穿回日放量门槛（默认 1.0×）
+      ④ max_days_since_crossback —— 新鲜度（默认 7 天）
+      硬排除 —— 反向拆股（≥8 倍机械跳空）的票直接剔除
 
     Returns:
         list[SignalEvent]: 含 signal_type="crossback_buy"
@@ -192,9 +250,17 @@ def run_ema_crossback_strategy(
             logger.warning(f"[crossback] {sym} no data, skipping")
             continue
 
+        # 硬排除：反向拆股 → EMA10 建立在混合价格基准上，「跌破 / 穿回」是假象
+        if has_split_gap(df, lookback=split_guard_lookback):
+            logger.info("[crossback] %s reverse split gap, skipped", sym)
+            continue
+
         crossbacks = detect_crossback(
             df, signal_date, ema_period=ema_period,
             vol_mult=vol_mult, vol_lookback=vol_lookback,
+            max_days_since_crossback=max_days_since_crossback,
+            require_currently_above=require_currently_above,
+            today=today,
         )
         for cb in crossbacks:
             # 计算 RS（10D/10W/SPY + O'Neil RS Rating）—— spec §6.2.4，使用正确签名

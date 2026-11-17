@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import pickle
 import re
 import sys
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.daily_bars import dedup_daily_bars  # noqa: E402
+from data.fundamentals import format_eps_value  # noqa: E402
 from data.stage import LABELS, STAGE_NAMES, StageResult, compute_stage  # noqa: E402
 
 MINUS = "\u2212"  # 减号，比 ASCII '-' 排版好看
@@ -71,6 +73,20 @@ def _money(value, dash: str = "—") -> str:
         return dash
     try:
         return f"${float(value):.2f}"
+    except (TypeError, ValueError):
+        return dash
+
+
+def _eps_money(value, dash: str = "—") -> str:
+    """EPS 显示：小于 1 分的保留有效位（$0.0025），普通金额 2 位小数。
+
+    直接用 _money 会把 $0.0025 显示成 $0.00 —— 读者以为它没赚钱，
+    而仓位档位规则读的是同一个数（`(eps or 0) > 0`），判成「不是正数」。
+    """
+    if value is None:
+        return dash
+    try:
+        return format_eps_value(value)
     except (TypeError, ValueError):
         return dash
 
@@ -399,6 +415,7 @@ class SignalView:
     cb_close: float | None = None   # 回踩当天的真实收盘价（从行情缓存按日期取）
     cb_ema10: float | None = None   # 回踩当天被上穿的 EMA10（从触发原因解析）
     cb_close_est: bool = False      # cb_close 是反推值（缓存里没有那根 bar）
+    days_since: int | None = None   # 距今多少个交易日（相对数据日）
 
 
 @dataclass
@@ -431,6 +448,29 @@ class ReportData:
     stale_symbols: list[str] = field(default_factory=list)
 
 
+def _eps_from_cache(cache_dir: Path, symbol: str) -> float | None:
+    """从本地 EPS 缓存读最新季度 EPS（不联网）。
+
+    触发原因串里的 EPS 只有 2 位小数，小于 1 分的（如 $0.0025）会被抹成
+    $0.00 —— 抹掉之后连「是不是正数」都判不出来。缓存里存的是原值。
+    """
+    path = Path(cache_dir) / f"eps_{symbol}.pkl"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = pickle.load(fh)
+    except Exception:
+        return None
+    history = data.get("eps_history") if isinstance(data, dict) else None
+    if not history:
+        return None
+    try:
+        return float(history[0][1])
+    except (TypeError, IndexError, ValueError):
+        return None
+
+
 def _build_signal_views(
     records: list[dict],
     date_str: str,
@@ -442,7 +482,15 @@ def _build_signal_views(
         symbol = (rec.get("股票") or "").strip()
         if not symbol:
             continue
-        parsed = parse_reason(rec.get("触发原因", ""))
+        reason = rec.get("触发原因", "")
+        parsed = parse_reason(reason)
+        # 当天的行：触发原因里的 EPS 若是 0（被 2 位小数抹平了），
+        # 回退到本地 EPS 缓存取原值。历史行不这么做 —— 那是拿今天的数据伪造归档。
+        if rec.get("日期") == date_str and "最新季度EPS" in reason:
+            if parsed.get("eps") in (None, 0):
+                cached = _eps_from_cache(cache_dir, symbol)
+                if cached is not None:
+                    parsed["eps"] = cached
         df = _load_bars(cache_dir, symbol)
         metrics = _compute_metrics(df, symbol) if df is not None else None
         # Weinstein 四阶段：判**当前**处于哪个阶段（信号触发时必然是 Stage 2，
@@ -660,6 +708,21 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
         days.add(session_day)
     data.data_day = max(days) if days else None
     data.session_day = session_day
+
+    # 回踩的「距今」：相对**数据日**（最新一根 K 线），不是运行日。
+    # 口径与 signals/report.py 的 watchlist 状态表一致（5/7 近似交易日，最小 1）。
+    _base = data.data_day
+    for v in data.today_cross + data.history_cross:
+        if not _base:
+            v.days_since = None
+            continue
+        try:
+            _d = datetime.strptime(v.date, "%Y-%m-%d").date()
+            _delta = (datetime.strptime(_base, "%Y-%m-%d").date() - _d).days
+            v.days_since = 0 if _delta <= 0 else max(1, round(_delta * 5 / 7))
+        except (ValueError, TypeError):
+            v.days_since = None
+
     data.stale_symbols = [
         v.symbol for v in data.today_main
         if v.metrics and data.data_day and v.metrics.last_day != data.data_day
@@ -697,16 +760,25 @@ FIELD_GLOSSARY = [
 CROSSBACK_GLOSSARY = [
     ("信号日期 / 回踩日", "回踩**实际发生**的那根 K 线日期（数据日），不是运行日",
      "执行时点与主策略一样 = 下一个美股开盘"),
+    ("距今", "回踩日距**数据日**多少个交易日",
+     "新鲜度闸门：>7 天视为过期，不作为行动依据（第二层协议条件④）"),
     ("触发收盘", "回踩当天的**真实收盘价**（从行情缓存按该日 bar 取）",
      "`≈` = 缓存里没那根 bar，用 EMA10×(1+上穿涨幅) 反推的估算值"),
     ("上穿EMA10", "回踩当天被上穿的 **EMA(10)** —— **不是收盘价**",
      "价格从下方穿回这条均线；离得越近说明回踩越浅"),
     ("上穿涨幅", "(触发收盘 − EMA10) ÷ EMA10", "涨幅大 = 穿得干脆；≤1% 常常是假突破"),
     ("量比", "回踩当日成交量 ÷ 前 20 个**交易日**均量",
-     "≥1.5x 才有意义；1.5–2.0x→3★，2.0–3.0x→4★，≥3.0x→5★"),
+     "≥1.0x 才算放量（协议条件③）；1.0–1.5x→2★，1.5–2.0x→3★，2.0–3.0x→4★，≥3.0x→5★"),
     ("参考止损", "该股 watchlist 条目的 stage2_stop = 主信号日收盘 × 0.92",
      "破位离场，不因为「回踩成功」就放宽止损"),
     ("现价", "最新一根 K 线（数据日）的收盘价", "跟触发收盘比 = 回踩之后走了多远"),
+    ("RS", "O'Neil RS Rating（全市场加权收益百分位 1-99，越高越强）",
+     "≥80 属 CAN SLIM 合格区间；回踩票的 RS 越高越值得优先做"),
+    ("RS/SPY", "过去 252 个交易日涨幅 ÷ SPY 同期涨幅（倍数）", "1.0x = 与大盘同步；>1.5x 明显跑赢"),
+    ("10W", "过去 50 个交易日涨幅 ÷ SPY 同期涨幅（倍数）", "中期动能，比 10D 更稳"),
+    ("10D", "过去 10 个交易日涨幅 ÷ SPY 同期涨幅（倍数）", "短期动能；<1.0x 说明近两周在跟跌"),
+    ("板块", "GICS 一级行业（Nasdaq screener 分类）", "同一板块一起看更容易判断合力方向"),
+    ("板块排名", "该股在本板块内的 RS 排名（名次/总数）", "1/664 = 板块最强；分母大 = 竞争充分"),
     ("状态", "现价 vs 参考止损", "🟢 持有｜🟡 贴止损（3% 内）｜🔴 已破止损"),
 ]
 
@@ -858,7 +930,7 @@ def _main_row(v: SignalView) -> str:
         _stage_cell(v),
         _stars(v.strength),
         f"**{_money(v.stop)}**",
-        f"**{_money(p.get('eps'))}**",
+        f"**{_eps_money(p.get('eps'))}**",
         f"**{p.get('yoy') or '—'}**",
         f"**{p.get('qoq') or '—'}**",
         _streak_cell(p.get("yoy_streak")),
@@ -884,7 +956,7 @@ def _history_row(v: SignalView) -> str:
         _stage_cell(v, bold=False),
         _stars(v.strength),
         _money(v.stop),
-        _money(p.get("eps")),
+        _eps_money(p.get("eps")),
         p.get("yoy") or "—",
         p.get("qoq") or "—",
         _streak_cell(p.get("yoy_streak"), bold=False),
@@ -930,6 +1002,7 @@ def _cross_today_row(v: SignalView) -> str:
     p = v.parsed
     cells = [
         f"**{v.date}**",
+        _cross_days_cell(v),
         f"**{v.symbol}**",
         _stage_cell(v),
         _stars(v.strength),
@@ -939,6 +1012,12 @@ def _cross_today_row(v: SignalView) -> str:
         _pct(p.get("cb_pct")),
         f"**{_x(p.get('cb_vol'))}**" if p.get("cb_vol") is not None else "—",
         f"**{_money(v.stop)}**" if v.stop else "—",
+        f"**{int(v.rs_rating)}**" if v.rs_rating is not None else "—",
+        f"**{_x(v.rs_spy)}**" if v.rs_spy is not None else "—",
+        f"**{_x(v.rs_10w)}**" if v.rs_10w is not None else "—",
+        f"**{_x(v.rs_10d)}**" if v.rs_10d is not None else "—",
+        f"**{v.sector}**" if v.sector else "—",
+        f"**{v.sector_rank}**" if v.sector_rank else "—",
         _cross_status(v),
     ]
     return "| " + " | ".join(cells) + " |"
@@ -948,6 +1027,7 @@ def _cross_history_row(v: SignalView) -> str:
     p = v.parsed
     cells = [
         v.date,
+        _cross_days_cell(v),
         v.symbol,
         _stage_cell(v, bold=False),
         _stars(v.strength),
@@ -957,9 +1037,24 @@ def _cross_history_row(v: SignalView) -> str:
         _x(p.get("cb_vol")),
         _money(v.stop),
         _money(v.metrics.px if v.metrics else None),
+        f"{int(v.rs_rating)}" if v.rs_rating is not None else "—",
+        _x(v.rs_spy),
+        _x(v.rs_10w),
+        _x(v.rs_10d),
+        v.sector or "—",
+        v.sector_rank or "—",
         _cross_status(v),
     ]
     return "| " + " | ".join(cells) + " |"
+
+
+def _cross_days_cell(v: SignalView) -> str:
+    """距今（交易日）—— 新鲜度闸门的可视化。"""
+    if v.days_since is None:
+        return "—"
+    if v.days_since <= 0:
+        return "当日"
+    return f"{v.days_since} 交易日"
 
 
 # --------------------------------------------------------------------------
@@ -1007,7 +1102,7 @@ def _attention_rows(data: ReportData) -> list[tuple[str, str, str]]:
             rows.append((v.symbol, f"EPS 同比只 **+{yoy:.1f}%**（正增长里最低的一档）",
                          "🟡 基本面与强度背离 → 仓位取中间档"))
         if v.parsed.get("eps") is not None and v.parsed["eps"] < 0:
-            rows.append((v.symbol, f"EPS **{_money(v.parsed['eps'])} 仍亏损**，\"亏损收窄\" ≠ 盈利增长",
+            rows.append((v.symbol, f"EPS **{_eps_money(v.parsed['eps'])} 仍亏损**，\"亏损收窄\" ≠ 盈利增长",
                          "⚠️ 强度可以，但**不是基本面驱动** → 强势股里风险最低的一档"))
         if v.metrics and v.metrics.chg >= 10:
             rows.append((v.symbol, f"当日已 **{_pct(v.metrics.chg)}**，偏离均线较多"
@@ -1158,7 +1253,7 @@ def render_markdown(data: ReportData, today: date) -> str:
     w("")
 
     # ---------------- 段 1 ----------------
-    w("## 📊 段 1：完整信号表（v_eps_v2 主策略，今日 + 过去 7 天）")
+    w("## 📊 段 1（**第一层**）：完整信号表（v_eps_v2 主策略 — Weinstein Stage 2 + EPS，今日 + 过去 7 天）")
     w("")
     w("| 信号日期 | 股票 | 阶段 | 强度 | 参考止损 | 最新季度 EPS | EPS 同比 (YoY) | EPS 环比 (QoQ) "
       "| 连续同比季度 | 连续环比季度 | 量比 (vs/20日均量) | RS Rating | RS/SPY (长期) "
@@ -1197,23 +1292,27 @@ def render_markdown(data: ReportData, today: date) -> str:
     w("")
 
     # ---------------- 段 1.5 ----------------
-    w("## 📊 段 1.5：EMA10 回踩子策略（watchlist）")
+    w("## 📊 段 1.5（**第二层**）：EMA10 回踩子策略（watchlist — 进场时机）")
+    w("")
+    w("> **第二层协议（4 条件全满足才发信号）**：① 自加入日起曾跌破 EMA10 "
+      "② 当前已站回 EMA10 上方 ③ 穿回日放量 ≥1.0×20日均量 "
+      "④ 穿回日距今 ≤7 天（新鲜度）｜另排除反向拆股（≥8 倍机械跳空）的票。")
     w("")
     w(f"### 今日新增（回踩日 = 数据日 {d.session_day or d.date_str}）")
     w("")
-    w("| 信号日期 | 股票 | 阶段 | 强度 | 现价 | 触发收盘 | 上穿EMA10 | 上穿涨幅 | 量比 | 参考止损 | 状态 |")
-    w("|---------|------|------|------|------|----------|-----------|----------|------|----------|------|")
+    w("| 信号日期 | 距今 | 股票 | 阶段 | 强度 | 现价 | 触发收盘 | 上穿EMA10 | 上穿涨幅 | 量比 | 参考止损 | RS | RS/SPY | 10W | 10D | 板块 | 板块排名 | 状态 |")
+    w("|---------|------|------|------|------|------|----------|-----------|----------|------|----------|----|--------|-----|-----|------|---------|------|")
     if d.today_cross:
         for v in d.today_cross:
             w(_cross_today_row(v))
     else:
-        w(f"| **{d.session_day or d.date_str}** | **— 无新增 —** | — | — | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
+        w(f"| **{d.session_day or d.date_str}** | — | **— 无新增 —** | — | — | — | — | — | — | — | — | — | — | — | — | — | — | ⚪ 数据日无回踩 |")
     w("")
     if d.history_cross:
         w("### 过去 7 天 watchlist 回踩")
         w("")
-        w("| 回踩日 | 股票 | 阶段 | 强度 | 触发收盘 | 上穿EMA10 | 上穿涨幅 | 量比 | 参考止损 | 现价 | 状态 |")
-        w("|--------|------|------|------|----------|-----------|----------|------|----------|------|------|")
+        w("| 回踩日 | 距今 | 股票 | 阶段 | 强度 | 触发收盘 | 上穿EMA10 | 上穿涨幅 | 量比 | 参考止损 | 现价 | RS | RS/SPY | 10W | 10D | 板块 | 板块排名 | 状态 |")
+        w("|--------|------|------|------|------|----------|-----------|----------|------|----------|------|----|--------|-----|-----|------|---------|------|")
         for v in d.history_cross:
             w(_cross_history_row(v))
         w("")
@@ -1459,6 +1558,13 @@ def render_markdown(data: ReportData, today: date) -> str:
         "**历史行未按新口径重算**：段 1 里今日行的量比/均线/突破是按交易日重算的；"
         "历史行沿用当时入库的值，两种口径不可直接比。"
     )
+    if d.history_cross:
+        caveats.append(
+            "**段 1.5 的历史回踩行是旧协议下产生的**：第二层协议现在要求"
+            "「**当前仍站回 EMA10 上方**」——一只票回踩当天成立、之后又跌回 EMA10 下方，"
+            "就**不再是当前信号**了。历史行仍保留（那是当时的事实），"
+            "但**不能直接当今天的进场依据**，请以「今日新增」段和当前价是否站上 EMA10 为准。"
+        )
     for i, text in enumerate(caveats, 1):
         w(f"{i}. {text}")
     w("")
@@ -1516,7 +1622,7 @@ def build_paste_block(data: ReportData) -> str:
         ratio = _vol_cell(v, recompute=True, bold=False)
         lines.append(
             f"| **{v.symbol}** | {_stage_cell(v, bold=False)} | {_stars(v.strength)} | {_money(v.stop)} | "
-            f"{_money(p.get('eps'))} | "
+            f"{_eps_money(p.get('eps'))} | "
             f"{p.get('yoy') or '—'} | {p.get('qoq') or '—'} | {ratio} | "
             f"{int(v.rs_rating) if v.rs_rating is not None else '—'} | {_x(v.rs_spy)} | "
             f"{_x(v.rs_10w)} | {_x(v.rs_10d)} | {v.sector or '—'} |"
