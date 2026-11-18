@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from data.daily_bars import dedup_daily_bars
@@ -45,6 +46,85 @@ REASON_PREFIX_CROSSBACK = "[EMA10回踩]"
 DEFAULT_VOL_MULT = 1.0                      # 放量穿回：量比 ≥ 1.0×20日均量
 DEFAULT_MAX_DAYS_SINCE_CROSSBACK = 7        # 新鲜度：穿回日距今 ≤ 7 天
 DEFAULT_SPLIT_GUARD_LOOKBACK = 30           # 反向拆股检查窗口（根 K 线）
+
+
+def _prepare_crossback_frame(
+    df: pd.DataFrame | None,
+    signal_date: pd.Timestamp,
+    ema_period: int,
+    vol_lookback: int,
+) -> pd.DataFrame | None:
+    """去重 + 算 ema10 / avg_vol_20 + 切到 signal_date 之后。
+
+    返回 None 表示数据不足（不足 ema_period + vol_lookback 根）。
+    """
+    if df is None or len(df) < ema_period + vol_lookback:
+        return None
+
+    # 同一天可能有「合并量 bar + IEX bar」两根 → 窗口必须按**交易日**算，不能按行数算
+    df = dedup_daily_bars(df)
+    if len(df) < ema_period + vol_lookback:
+        return None
+
+    df = df.copy()
+    df["ema10"] = df["close"].ewm(span=ema_period, adjust=False).mean()
+    # shift(1)：今日成交量 ÷ 过去 20 日均量（不含今日）
+    df["avg_vol_20"] = df["volume"].rolling(vol_lookback).mean().shift(1)
+
+    # tz-aware fix: signal_date 可能是 tz-naive Timestamp（如 YYYY-MM-DD 字符串），
+    # 但 df.index 可能是 tz-aware UTC（如 fetch 拿到的实盘数据）。比较前需统一。
+    if df.index.tz is not None and signal_date.tz is None:
+        signal_date = signal_date.tz_localize("UTC")
+
+    df = df[df.index >= signal_date]
+    if df.empty:
+        return None
+    return df
+
+
+def _scan_crossback_events(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    """状态机扫描：找出所有「上穿 EMA10」事件（**不**施加量能/新鲜度/当前站上方闸门）。
+
+    Issue 3 修复：初值根据 signal_date 当日状态决定
+    ----------------------------------------------------
+    初值必须是 "above"：state 只能被**真的跌破**（close < ema10）改写成 "below"。
+    早期版本用 "<=" 把「收盘价恰好等于 EMA10」也算作跌破 —— 而 EMA10 的第一个值
+    恒等于第一个收盘价，于是任何「从 data 起点开始扫」的股票在第 2 根 bar 就会被
+    判成「上穿 EMA10」（这个假象原先被 1.5× 的量能门槛挡住，门槛放宽到 1.0× 后暴露）。
+    母项目的判据同样是严格的：below_mask = slice_close < slice_ema10。
+
+    signal_date 当日若真的在 EMA10 下方，循环第 1 轮就会把 state 置成 "below"，
+    Issue 3 的行为不变。
+
+    上穿事件一旦发生，state 就回到 "above" —— **即使量能不足**（那次的信号被丢掉，
+    但「上穿过」这个事实仍然发生过，之后再跌破再上穿才算新事件）。
+    诊断必须能看到被量能挡掉的事件，所以扫描与量能闸门必须分开。
+    """
+    close = frame["close"].to_numpy(dtype=float)
+    ema = frame["ema10"].to_numpy(dtype=float)
+    avg = frame["avg_vol_20"].to_numpy(dtype=float)
+    vol = frame["volume"].to_numpy(dtype=float)
+    dates = frame.index
+
+    events: list[dict[str, Any]] = []
+    state = "above"
+    for i in range(len(close)):
+        if np.isnan(avg[i]):
+            continue
+
+        if close[i] < ema[i]:
+            state = "below"
+        elif state == "below" and close[i] > ema[i]:
+            events.append({
+                "date": dates[i],
+                "close": float(close[i]),
+                "ema10": float(ema[i]),
+                "volume": float(vol[i]),
+                "avg_vol_20": float(avg[i]),
+                "volume_ratio": float(vol[i] / avg[i]),
+            })
+            state = "above"
+    return events
 
 
 def detect_crossback(
@@ -68,75 +148,97 @@ def detect_crossback(
         list of dict: [{date, close, ema10, volume, avg_vol_20, volume_ratio, strength}]
         失败/数据不足时返回 []
     """
-    if df is None or len(df) < ema_period + vol_lookback:
-        return []
-
-    # 同一天可能有「合并量 bar + IEX bar」两根 → 窗口必须按**交易日**算，不能按行数算
-    df = dedup_daily_bars(df)
-    if len(df) < ema_period + vol_lookback:
-        return []
-
-    df = df.copy()
-    df["ema10"] = df["close"].ewm(span=ema_period, adjust=False).mean()
-    # shift(1)：今日成交量 ÷ 过去 20 日均量（不含今日）
-    df["avg_vol_20"] = df["volume"].rolling(vol_lookback).mean().shift(1)
-
-    # tz-aware fix: signal_date 可能是 tz-naive Timestamp（如 YYYY-MM-DD 字符串），
-    # 但 df.index 可能是 tz-aware UTC（如 fetch 拿到的实盘数据）。比较前需统一。
-    if df.index.tz is not None and signal_date.tz is None:
-        signal_date = signal_date.tz_localize("UTC")
-
-    df = df[df.index >= signal_date]
-    if df.empty:
+    frame = _prepare_crossback_frame(df, signal_date, ema_period, vol_lookback)
+    if frame is None:
         return []
 
     # 条件 ②：当前已站回 EMA10 上方。
     # 上穿后又跌回 EMA10 下面 → 那次上穿已经作废，不再是「可行动」的进场时点。
     if require_currently_above:
-        last_row = df.iloc[-1]
+        last_row = frame.iloc[-1]
         if not (last_row["close"] > last_row["ema10"]):
             return []
 
-    # Issue 3 修复：初值根据 signal_date 当日状态决定
-    #
-    # 初值必须是 "above"：state 只能被**真的跌破**（close < ema10）改写成 "below"。
-    # 早期版本用 "<=" 把「收盘价恰好等于 EMA10」也算作跌破 —— 而 EMA10 的第一个值
-    # 恒等于第一个收盘价，于是任何「从 data 起点开始扫」的股票在第 2 根 bar 就会被
-    # 判成「上穿 EMA10」（这个假象原先被 1.5× 的量能门槛挡住，门槛放宽到 1.0× 后暴露）。
-    # 母项目的判据同样是严格的：below_mask = slice_close < slice_ema10。
-    #
-    # signal_date 当日若真的在 EMA10 下方，循环第 1 轮就会把 state 置成 "below"，
-    # Issue 3 的行为不变。
-    state = "above"
-
+    # 条件 ③：穿回当日必须放量（量比 ≥ vol_mult × 20 日均量）
     signals = []
-    for date, row in df.iterrows():
-        if pd.isna(row["avg_vol_20"]):
+    for ev in _scan_crossback_events(frame):
+        if ev["volume_ratio"] < vol_mult:
             continue
-
-        if row["close"] < row["ema10"]:
-            state = "below"
-        elif state == "below" and row["close"] > row["ema10"]:
-            vol_ratio = row["volume"] / row["avg_vol_20"]
-            if vol_ratio >= vol_mult:
-                signals.append({
-                    "date": date,
-                    "close": row["close"],
-                    "ema10": row["ema10"],
-                    "volume": row["volume"],
-                    "avg_vol_20": row["avg_vol_20"],
-                    "volume_ratio": vol_ratio,
-                    "strength": _crossback_strength(vol_ratio),
-                })
-            state = "above"
+        ev["strength"] = _crossback_strength(ev["volume_ratio"])
+        signals.append(ev)
 
     # 条件 ④：新鲜度过滤 —— 穿回日距今超过窗口视为过期
     if max_days_since_crossback is not None and signals:
-        ref_date = _reference_date(df, today)
+        ref_date = _reference_date(frame, today)
         cutoff = ref_date - timedelta(days=max_days_since_crossback)
         signals = [s for s in signals if s["date"].date() >= cutoff]
 
     return signals
+
+
+def diagnose_crossback(
+    df: pd.DataFrame | None,
+    signal_date: pd.Timestamp,
+    ema_period: int = 10,
+    vol_mult: float = DEFAULT_VOL_MULT,
+    vol_lookback: int = 20,
+    max_days_since_crossback: int | None = DEFAULT_MAX_DAYS_SINCE_CROSSBACK,
+    require_currently_above: bool = True,
+    today: datetime | None = None,
+) -> dict[str, Any] | None:
+    """最近一次「上穿 EMA10」事件的**逐条件**诊断。
+
+    为什么需要它：第二层当天报「0 个新增」时，用户分不清是「市场没机会」
+    还是「协议把机会挡掉了」。这两件事的行动方式完全不同，必须逐条说清。
+
+    Returns:
+        dict: {date, close, ema10, volume_ratio, days_since, ref_date, data_day,
+               current_close, current_ema10, checks, blocked_by, passed}
+        None = 这只票压根没有上穿事件（从没跌破过 EMA10，或数据不足）
+    """
+    frame = _prepare_crossback_frame(df, signal_date, ema_period, vol_lookback)
+    if frame is None:
+        return None
+
+    events = _scan_crossback_events(frame)
+    if not events:
+        return None
+
+    ev = events[-1]
+    last = frame.iloc[-1]
+    ref_date = _reference_date(frame, today)
+    days_since = (ref_date - ev["date"].date()).days
+    fresh_ok = max_days_since_crossback is None or days_since <= max_days_since_crossback
+
+    checks = [
+        {"id": "①", "label": "曾跌破 EMA10", "passed": True,
+         "detail": f"{ev['date'].date()} 前确实跌破过 EMA10"},
+        {"id": "②", "label": "当前仍站回 EMA10 上方",
+         "passed": bool(last["close"] > last["ema10"]),
+         "detail": f"现价 ${float(last['close']):.2f} vs EMA10 ${float(last['ema10']):.2f}"},
+        {"id": "③", "label": f"穿回日放量 ≥{vol_mult:g}x",
+         "passed": bool(ev["volume_ratio"] >= vol_mult),
+         "detail": f"量比 {ev['volume_ratio']:.2f}x"},
+        {"id": "④", "label": f"距今 ≤{max_days_since_crossback} 天",
+         "passed": bool(fresh_ok),
+         "detail": f"{days_since} 天"},
+    ]
+    blocked_by = [c["id"] for c in checks if not c["passed"]]
+
+    return {
+        "date": ev["date"],
+        "close": ev["close"],
+        "ema10": ev["ema10"],
+        "volume_ratio": ev["volume_ratio"],
+        "days_since": days_since,
+        "ref_date": ref_date,
+        "data_day": frame.index[-1].date(),
+        "current_close": float(last["close"]),
+        "current_ema10": float(last["ema10"]),
+        "checks": checks,
+        "blocked_by": blocked_by,
+        "passed": not blocked_by,
+    }
 
 
 def _reference_date(df: pd.DataFrame, today: datetime | None) -> "datetime.date":

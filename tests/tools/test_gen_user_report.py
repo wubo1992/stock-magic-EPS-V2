@@ -741,3 +741,148 @@ def test_historical_rows_keep_their_own_eps_text(env):
     )
     history = md.split("过去 7 天")[1] if "过去 7 天" in md else md
     assert "$0.0025" not in history, f"历史行被今天的 EPS 覆盖了：\n{history}"
+
+
+# ---------------------------------------------------------------------------
+# 第二层「今天 0 个回踩」时，必须说清监控票卡在哪个协议条件上
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def blocked_env(tmp_path: Path) -> dict:
+    """一只「上穿过 EMA10 但被协议挡住」的监控票（量能不足 → 条件③）。
+
+    前 20 天 10 → 20（EMA10 暖起来），之后趴在 10（跌破 EMA10），
+    最后一根跳到 22（> EMA10）但量能只有 0.5×20 日均量 → 上穿事件成立、
+    量能门槛不成立 → 条件③ 把这只票挡住。
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    n = 200
+    closes = [10 + i * (10 / 19) for i in range(20)] + [10.0] * (n - 21) + [22.0]
+    vols = [1_000_000] * n
+    vols[-1] = 500_000
+    dates = pd.date_range(end="2026-11-05", periods=n, freq="B", tz="UTC")
+    pd.to_pickle(
+        pd.DataFrame(
+            {"open": closes, "high": closes, "low": closes, "close": closes, "volume": vols},
+            index=dates,
+        ),
+        cache / "BLOCKED.pkl",
+    )
+    pd.to_pickle(_make_bars(200, close=700.0, volume=1_000_000), cache / "SPY.pkl")
+
+    csv_path = tmp_path / "signals.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        csv.DictWriter(f, fieldnames=CSV_HEADER).writeheader()
+
+    wl_path = tmp_path / "watchlist.json"
+    wl_path.write_text(json.dumps({
+        "BLOCKED": {
+            "symbol": "BLOCKED", "signal_date": "2026-08-01", "signal_price": 10.0,
+            "stage2_stop": 9.2, "added_at": "2026-08-01T01:25:25+00:00",
+            "expires_at": "2026-12-01T01:25:25+00:00",
+            "crossback_count": 0, "last_crossback_date": None,
+        },
+    }), encoding="utf-8")
+
+    uni_path = tmp_path / "rs_universe.json"
+    uni_path.write_text(json.dumps({
+        "symbols": {"BLOCKED": {"name": "Blocked Inc", "gics_sector": "Information Technology"}}
+    }), encoding="utf-8")
+
+    return {
+        "signals_csv": csv_path, "watchlist": wl_path, "cache_dir": cache,
+        "universe": uni_path, "date": "2026-11-06",
+    }
+
+
+def test_report_lists_crossback_candidates_blocked_by_protocol(blocked_env):
+    """第二层报 0 个时，必须逐条说出监控票卡在哪个条件上。
+
+    只写「0 个回踩」等于什么都没说 —— 用户分不清「市场没机会」和
+    「协议把机会挡掉了」，这两种情况的行动完全不同。
+    """
+    md = build_user_report(
+        date_str=blocked_env["date"], signals_csv=blocked_env["signals_csv"],
+        watchlist_path=blocked_env["watchlist"], cache_dir=blocked_env["cache_dir"],
+        universe_path=blocked_env["universe"],
+    )
+    assert "被协议挡掉的票" in md, "报告里没有「被协议挡掉的候选」这一段"
+    section = md.split("被协议挡掉的票", 1)[1]
+    row = [ln for ln in section.splitlines() if ln.startswith("| **BLOCKED**")]
+    assert row, f"被挡掉的候选没进表：\n{section}"
+    assert "③" in row[0], f"没写清卡在哪个条件：{row[0]}"
+    assert "0.50x" in row[0], f"没写清上穿当天的量比：{row[0]}"
+    assert "2026-11-05" in row[0], f"没写清上穿日：{row[0]}"
+
+
+def test_report_does_not_list_passing_candidates_as_blocked(blocked_env):
+    """四条件全过的票是真信号，不该出现在「被挡掉」表里。"""
+    df = pd.read_pickle(blocked_env["cache_dir"] / "BLOCKED.pkl")
+    df.iloc[-1, df.columns.get_loc("volume")] = 3_000_000   # 量比 3.0x → 全过
+    pd.to_pickle(df, blocked_env["cache_dir"] / "BLOCKED.pkl")
+
+    md = build_user_report(
+        date_str=blocked_env["date"], signals_csv=blocked_env["signals_csv"],
+        watchlist_path=blocked_env["watchlist"], cache_dir=blocked_env["cache_dir"],
+        universe_path=blocked_env["universe"],
+    )
+    section = md.split("被协议挡掉的票", 1)[1]
+    row = [ln for ln in section.splitlines() if ln.startswith("| **BLOCKED**")]
+    assert not row, f"四条件全过的票不该被列为「被挡掉」：{row}"
+
+
+def test_report_flags_volume_ratio_broken_by_source_switch(blocked_env):
+    """数据源换挡会把 20 日均量抬高，量比被压成 0.0x —— 报告必须标出来。
+
+    行情 pkl 在 2026-10-23 前后换过源：合并量 bar（00:00 UTC，量是全市场）→
+    IEX bar（05:00 UTC，量小两个数量级）。同一天两根 bar 的情况 dedup 能处理，
+    跨日期换源处理不了 → 20 日均量混了两个量纲 → 量比失真。
+    """
+    n = 200
+    closes = [10 + i * (10 / 19) for i in range(20)] + [10.0] * (n - 21) + [22.0]
+    vols = [100_000.0] * n
+    for i in range(180):                       # 前 180 根是「合并量」口径
+        vols[i] = 5_000_000.0
+    vols[-1] = 150_000.0                       # 上穿当天（IEX 口径）
+    idx = pd.date_range(end="2026-11-05", periods=n, freq="B", tz="UTC")
+    idx = pd.DatetimeIndex(
+        [t.replace(hour=0) for t in idx[:180]] + [t.replace(hour=5) for t in idx[180:]]
+    )
+    pd.to_pickle(
+        pd.DataFrame(
+            {"open": closes, "high": closes, "low": closes, "close": closes, "volume": vols},
+            index=idx,
+        ),
+        blocked_env["cache_dir"] / "BLOCKED.pkl",
+    )
+
+    md = build_user_report(
+        date_str=blocked_env["date"], signals_csv=blocked_env["signals_csv"],
+        watchlist_path=blocked_env["watchlist"], cache_dir=blocked_env["cache_dir"],
+        universe_path=blocked_env["universe"],
+    )
+    section = md.split("被协议挡掉的票", 1)[1]
+    row = [ln for ln in section.splitlines() if ln.startswith("| **BLOCKED**")]
+    assert row, f"被挡掉的候选没进表：\n{section}"
+    assert "量纲" in row[0], f"量比失真没标出来：{row[0]}"
+    assert "1.50x" in row[0], f"没给出同源口径的真实量比：{row[0]}"
+
+
+def test_paste_block_explains_why_no_crossback(blocked_env):
+    """日报贴片段落里也要有「今天为什么没有回踩」的答案。
+
+    贴片段落是每天直接贴给用户看的东西 —— 只报「0 个回踩」等于让人自己去猜。
+    """
+    from datetime import date as _date
+
+    from tools.gen_user_report import _collect, build_paste_block
+
+    data = _collect(
+        blocked_env["date"], blocked_env["signals_csv"], blocked_env["watchlist"],
+        blocked_env["cache_dir"], blocked_env["universe"], 7,
+        _date.fromisoformat(blocked_env["date"]),
+    )
+    block = build_paste_block(data)
+    assert "BLOCKED" in block, f"贴片段落里没有回踩候选的说明：\n{block}"
+    assert "③" in block, f"贴片段落里没写清卡在哪个条件：\n{block}"

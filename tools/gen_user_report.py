@@ -39,6 +39,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -432,6 +433,24 @@ class WatchView:
 
 
 @dataclass
+class BlockedCrossback:
+    """监控池里「上穿过 EMA10 但没发出信号」的票 —— 卡在哪个协议条件上。"""
+
+    symbol: str
+    name: str | None
+    date: str              # 上穿日
+    volume_ratio: float    # 上穿当天的量比
+    current_close: float   # 最后一根 bar 的收盘价
+    current_ema10: float   # 最后一根 bar 的 EMA10
+    days_since: int        # 距报告日多少个自然日
+    data_day: str          # 最后一根 bar 的日期
+    blocked_by: list[str]  # 卡住的条件编号（②/③/④）
+    details: dict[str, str]
+    volume_ratio_same: float | None = None   # 同源口径的量比（数据源换挡时才是真的）
+    vol_scale_broken: bool = False           # 20 日均量混了两个量纲 → 量比失真
+
+
+@dataclass
 class ReportData:
     date_str: str
     data_day: str | None
@@ -446,6 +465,7 @@ class ReportData:
     sectors: dict = field(default_factory=dict)
     rs_pool: dict = field(default_factory=dict)
     stale_symbols: list[str] = field(default_factory=list)
+    blocked_cross: list[BlockedCrossback] = field(default_factory=list)
 
 
 def _eps_from_cache(cache_dir: Path, symbol: str) -> float | None:
@@ -597,6 +617,160 @@ def _build_watch_views(watchlist: dict, cache_dir: Path, today: date) -> list[Wa
     return out
 
 
+def _load_crossback_config() -> dict:
+    """读 config.yaml 的 ema_crossback 段（读不到就用模块默认值）。
+
+    协议参数必须跟策略运行时用的是同一份 —— 报告里写的门槛跟实际发信号的
+    门槛不一样，这份报告就废了。
+    """
+    path = PROJECT_ROOT / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+    section = cfg.get("ema_crossback")
+    return section if isinstance(section, dict) else {}
+
+
+def _diagnose_blocked_crossbacks(
+    watchlist: dict,
+    cache_dir: Path,
+    date_str: str,
+    universe: dict,
+) -> list[BlockedCrossback]:
+    """监控池里「上穿过 EMA10 但没发出信号」的票 —— 逐条说清卡在哪个条件。
+
+    第二层当天报「0 个新增」时，光说 0 等于什么都没说：用户分不清
+    「市场没机会」和「协议把机会挡掉了」。这两种情况的行动完全不同
+    （前者不用动，后者可能值得手动介入）。
+
+    参照日用**报告日**（跟策略运行时一致 —— 策略拿 `today` = 运行时刻算新鲜度）。
+    """
+    from strategies.ema_crossback.ema_crossback_strategy import (
+        DEFAULT_MAX_DAYS_SINCE_CROSSBACK,
+        DEFAULT_VOL_MULT,
+        diagnose_crossback,
+    )
+
+    cfg = _load_crossback_config()
+    vol_mult = float(cfg.get("volume_mult", DEFAULT_VOL_MULT))
+    max_days = cfg.get("max_days_since_crossback", DEFAULT_MAX_DAYS_SINCE_CROSSBACK)
+    require_above = bool(cfg.get("require_currently_above", True))
+    ema_period = int(cfg.get("ema_period", 10))
+    vol_lookback = int(cfg.get("volume_lookback", 20))
+
+    # 只看最近的候选：太早的上穿早就过期了，列出来是噪声
+    horizon = max(int(max_days or 0) * 2, 14)
+
+    try:
+        ref = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return []
+
+    out: list[BlockedCrossback] = []
+    for symbol, entry in watchlist.items():
+        if not isinstance(entry, dict):
+            continue
+        df = _load_bars(cache_dir, symbol)
+        if df is None:
+            continue
+        signal_date = pd.Timestamp(str(entry.get("signal_date") or "1970-01-01"))
+        try:
+            diag = diagnose_crossback(
+                df, signal_date,
+                ema_period=ema_period,
+                vol_mult=vol_mult,
+                vol_lookback=vol_lookback,
+                max_days_since_crossback=max_days,
+                require_currently_above=require_above,
+                today=ref,
+            )
+        except Exception:
+            continue
+        if diag is None or diag["passed"]:
+            continue
+        if diag["days_since"] > horizon:
+            continue
+        info = universe.get(symbol, {}) if isinstance(universe, dict) else {}
+        # 量比是不是被「数据源换挡」压假了？（20 日均量混了两个量纲 → 条件③ 误杀）
+        same_ratio, broken = _same_source_volume_ratio(df, diag["date"])
+        out.append(
+            BlockedCrossback(
+                symbol=symbol,
+                name=info.get("name"),
+                date=diag["date"].date().isoformat(),
+                volume_ratio=diag["volume_ratio"],
+                current_close=diag["current_close"],
+                current_ema10=diag["current_ema10"],
+                days_since=diag["days_since"],
+                data_day=diag["data_day"].isoformat(),
+                blocked_by=list(diag["blocked_by"]),
+                details={c["id"]: c["detail"] for c in diag["checks"]},
+                volume_ratio_same=same_ratio,
+                vol_scale_broken=broken,
+            )
+        )
+    # 排序：先按「被几条条件挡住」（挡得越少越接近成交），再按距今天数
+    out.sort(key=lambda b: (len(b.blocked_by), b.days_since))
+    return out
+
+
+def _same_source_volume_ratio(df: pd.DataFrame, event_ts: pd.Timestamp) -> tuple[float | None, bool]:
+    """同源口径的量比 + 是否发生**数据源换挡**。
+
+    行情 pkl 在 2026-10-23 前后换过源：之前是「合并量」bar（00:00 UTC，量是全市场），
+    之后只剩「IEX」bar（04:00/05:00 UTC，量小 1~3 个数量级）。
+    同一天两根 bar 的情况 `dedup_daily_bars` 能处理（留最晚那根），但**跨日期换源**处理不了：
+    20 日均量把两个量纲混在一起 → 量比被压到 0.0x → 条件③ 永远不成立（真信号被误杀）。
+
+    监控池 113 只里现在有 5 只踩在这个断档上（NCPL 643x / IMCC 3040x / ESP 26x / FDBC 19x / SEER 4x）。
+
+    Returns:
+        (同源量比 or None, 是否换挡)
+    """
+    d = dedup_daily_bars(df)
+    if d is None or d.empty:
+        return None, False
+    try:
+        pos = d.index.get_indexer([event_ts], method="nearest")[0]
+    except Exception:
+        return None, False
+    if pos < 0:
+        return None, False
+
+    window = d.iloc[max(0, pos - 29):pos + 1]
+    if len(window) < 10:
+        return None, False
+    hours = set(window.index.hour)
+    if len(hours) < 2:
+        return None, False
+
+    vol = window["volume"].astype(float)
+    pre = vol.iloc[:5].median()
+    post = vol.iloc[-5:].median()
+    if not pre or not post or pre / post <= 3:
+        return None, False
+
+    # 同源 = 与事件同一时间戳小时的历史 bar
+    same = d[d.index.hour == event_ts.hour]
+    try:
+        spos = same.index.get_indexer([event_ts], method="nearest")[0]
+    except Exception:
+        return None, True
+    if spos < 5:
+        return None, True
+    win = same.iloc[max(0, spos - 20):spos]["volume"].astype(float)
+    if len(win) < 5:
+        return None, True
+    avg = float(win.mean())
+    if not avg:
+        return None, True
+    return float(same.iloc[spos]["volume"]) / avg, True
+
+
 def _spy_vol_label(spy) -> str:
     """量能标签要同时看**量比和方向**。
 
@@ -697,6 +871,7 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
         universe=universe,
         sectors=sectors,
         rs_pool=_rs_pool_info(PROJECT_ROOT, date_str),
+        blocked_cross=_diagnose_blocked_crossbacks(watchlist, cache_dir, date_str, universe),
     )
     data.today_main.sort(key=lambda v: -(v.rs_rating or 0))
     data.history_main.sort(key=lambda v: v.date, reverse=True)
@@ -1048,6 +1223,34 @@ def _cross_history_row(v: SignalView) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
+def _blocked_cross_row(b: BlockedCrossback) -> str:
+    """一只「被协议挡掉」的候选 —— 卡在哪个条件、具体差多少。"""
+    pct = ((b.current_close - b.current_ema10) / b.current_ema10 * 100.0
+           if b.current_ema10 else None)
+    vs = (f"${b.current_close:.2f} vs EMA10 ${b.current_ema10:.2f}"
+          + (f"（{_pct(pct)}）" if pct is not None else ""))
+    why = "；".join(b.details.get(cid, "") for cid in b.blocked_by)
+    if b.vol_scale_broken:
+        vol_cell = f"{b.volume_ratio:.2f}x ⚠量纲失真"
+        if b.volume_ratio_same is not None:
+            vol_cell += f"（同源 {b.volume_ratio_same:.2f}x）"
+        else:
+            vol_cell += "（同源量比算不出）"
+    else:
+        vol_cell = f"{b.volume_ratio:.2f}x"
+    cells = [
+        f"**{b.symbol}**",
+        b.name or "—",
+        b.date,
+        vol_cell,
+        vs,
+        f"{b.days_since} 天",
+        "**" + " ".join(b.blocked_by) + "**",
+        why,
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
 def _cross_days_cell(v: SignalView) -> str:
     """距今（交易日）—— 新鲜度闸门的可视化。"""
     if v.days_since is None:
@@ -1315,6 +1518,28 @@ def render_markdown(data: ReportData, today: date) -> str:
         w("|--------|------|------|------|------|----------|-----------|----------|------|----------|------|----|--------|-----|-----|------|---------|------|")
         for v in d.history_cross:
             w(_cross_history_row(v))
+        w("")
+    w("### 今日未触发回踩的候选（被协议挡掉的票）")
+    w("")
+    if d.blocked_cross:
+        w("> 这些票**上穿过 EMA10**，但没满足四条件里的至少一条 —— "
+          "今天报「0 个回踩」时，它们就是被挡掉的那批。「卡在」列写的是挡它的那条条件。")
+        w("> 按「挡得少 → 距今近」排序：最上面那几只是**差一点就能进**的。"
+          f"「距今」按**自然日**、相对报告日 {d.date_str} 算（协议条件④用的就是自然日）。")
+        w("")
+        w("| 股票 | 公司 | 上穿日 | 上穿量比 | 现价 vs EMA10 | 距今 | 卡在 | 说明 |")
+        w("|------|------|--------|----------|---------------|------|------|------|")
+        for b in d.blocked_cross:
+            w(_blocked_cross_row(b))
+        w("")
+        if any(b.vol_scale_broken for b in d.blocked_cross):
+            w("> ⚠ **量纲失真**：行情 pkl 在 2026-10-23 前后换过数据源（合并量 bar → IEX bar），"
+              "换挡那几天算的 20 日均量混了两个量纲 → 量比被压到 0.0x。"
+              "括号里是**同源口径**的真实量比 —— 判 ③ 时该看这个数。")
+            w("")
+    else:
+        w("> 监控池里近两周没有「上穿过 EMA10 但没过协议」的票 —— "
+          "今天 0 个回踩是**市场没有机会**，不是协议挡掉了什么。")
         w("")
     w("**段 1.5 字段说明**：")
     w("")
@@ -1636,6 +1861,13 @@ def build_paste_block(data: ReportData) -> str:
     lines.append("**⚠️ 注意**：" + ("；".join(f"{s}：{p}" for s, p, _ in attention[:6])
                                     if attention else "无"))
     lines.append("")
+    if not data.today_cross and data.blocked_cross:
+        parts = []
+        for b in data.blocked_cross[:6]:
+            detail = "，".join(b.details.get(cid, "") for cid in b.blocked_by)
+            parts.append(f"{b.symbol} 卡 {' '.join(b.blocked_by)}（{detail}）")
+        lines.append(f"**回踩（今日 0 个，被协议挡掉）**：" + "；".join(parts))
+        lines.append("")
     spy = data.market.get("spy")
     if spy:
         lines.append(
