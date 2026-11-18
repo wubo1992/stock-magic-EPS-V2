@@ -832,8 +832,8 @@ def test_report_does_not_list_passing_candidates_as_blocked(blocked_env):
     assert not row, f"四条件全过的票不该被列为「被挡掉」：{row}"
 
 
-def test_report_flags_volume_ratio_broken_by_source_switch(blocked_env):
-    """数据源换挡会把 20 日均量抬高，量比被压成 0.0x —— 报告必须标出来。
+def _write_source_switch_frame(blocked_env, cross_volume: float) -> None:
+    """造一个**跨了数据源换挡**的行情文件。
 
     行情 pkl 在 2026-10-23 前后换过源：合并量 bar（00:00 UTC，量是全市场）→
     IEX bar（05:00 UTC，量小两个数量级）。同一天两根 bar 的情况 dedup 能处理，
@@ -844,7 +844,7 @@ def test_report_flags_volume_ratio_broken_by_source_switch(blocked_env):
     vols = [100_000.0] * n
     for i in range(180):                       # 前 180 根是「合并量」口径
         vols[i] = 5_000_000.0
-    vols[-1] = 150_000.0                       # 上穿当天（IEX 口径）
+    vols[-1] = cross_volume                    # 上穿当天（IEX 口径）
     idx = pd.date_range(end="2026-11-05", periods=n, freq="B", tz="UTC")
     idx = pd.DatetimeIndex(
         [t.replace(hour=0) for t in idx[:180]] + [t.replace(hour=5) for t in idx[180:]]
@@ -857,6 +857,11 @@ def test_report_flags_volume_ratio_broken_by_source_switch(blocked_env):
         blocked_env["cache_dir"] / "BLOCKED.pkl",
     )
 
+
+def test_report_flags_volume_ratio_broken_by_source_switch(blocked_env):
+    """跨源文件：量比要按**同源口径**读，并标出「同源样本不足 20 根」。"""
+    _write_source_switch_frame(blocked_env, cross_volume=80_000)   # 同源 0.8x → 仍被 ③ 挡住
+
     md = build_user_report(
         date_str=blocked_env["date"], signals_csv=blocked_env["signals_csv"],
         watchlist_path=blocked_env["watchlist"], cache_dir=blocked_env["cache_dir"],
@@ -866,7 +871,26 @@ def test_report_flags_volume_ratio_broken_by_source_switch(blocked_env):
     row = [ln for ln in section.splitlines() if ln.startswith("| **BLOCKED**")]
     assert row, f"被挡掉的候选没进表：\n{section}"
     assert "量纲" in row[0], f"量比失真没标出来：{row[0]}"
-    assert "1.50x" in row[0], f"没给出同源口径的真实量比：{row[0]}"
+    assert "0.80x" in row[0], f"没给出同源口径的真实量比：{row[0]}"
+    assert "同源样本 19/20" in row[0], f"没写清均量用了多少根同口径 bar：{row[0]}"
+
+
+def test_source_switch_no_longer_kills_a_qualified_crossback(blocked_env):
+    """换源后同源量比够 → 这只票**不该**再被列进「被挡掉」表。
+
+    修复前：跨口径均量把量比压到 0.03x → 条件③ 永远不成立 → 合格的票被误杀。
+    修复后：均量只跟同口径比 → 1.50x → 条件③ 通过 → 不再是「被挡掉」的候选。
+    """
+    _write_source_switch_frame(blocked_env, cross_volume=150_000)   # 同源 1.5x
+
+    md = build_user_report(
+        date_str=blocked_env["date"], signals_csv=blocked_env["signals_csv"],
+        watchlist_path=blocked_env["watchlist"], cache_dir=blocked_env["cache_dir"],
+        universe_path=blocked_env["universe"],
+    )
+    section = md.split("被协议挡掉的票", 1)[1]
+    row = [ln for ln in section.splitlines() if ln.startswith("| **BLOCKED**")]
+    assert not row, f"同源 1.5x 的票不该再被列为「被挡掉」：{row}"
 
 
 def test_paste_block_explains_why_no_crossback(blocked_env):
@@ -886,3 +910,22 @@ def test_paste_block_explains_why_no_crossback(blocked_env):
     block = build_paste_block(data)
     assert "BLOCKED" in block, f"贴片段落里没有回踩候选的说明：\n{block}"
     assert "③" in block, f"贴片段落里没写清卡在哪个条件：\n{block}"
+
+
+def test_scale_break_note_matches_the_cell_format(blocked_env):
+    """「量纲失真」的脚注必须跟表格里的写法一致。
+
+    表格列渲染成「0.80x ⚠量纲失真（同源样本 19/20）」—— 括号里是**样本根数**。
+    脚注如果还写「括号里是同源口径的真实量比」，用户会把 19/20 读成一个比例。
+    """
+    _write_source_switch_frame(blocked_env, cross_volume=80_000)
+
+    md = build_user_report(
+        date_str=blocked_env["date"], signals_csv=blocked_env["signals_csv"],
+        watchlist_path=blocked_env["watchlist"], cache_dir=blocked_env["cache_dir"],
+        universe_path=blocked_env["universe"],
+    )
+    notes = [ln for ln in md.splitlines() if ln.startswith("> ⚠ **量纲失真**")]
+    assert notes, f"没找到量纲失真的脚注：\n{md}"
+    assert "同源样本" in notes[0], f"脚注没解释括号里的同源样本数：{notes[0]}"
+    assert "真实量比" not in notes[0], f"脚注还在把括号说成另一个量比：{notes[0]}"

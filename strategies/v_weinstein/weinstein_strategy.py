@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from data.daily_bars import dedup_daily_bars
+from data.daily_bars import dedup_daily_bars, same_regime_volume_ma
 from events import EventQueue, SignalEvent
 from strategies.base import StrategyBase
 
@@ -180,11 +180,14 @@ class WeinsteinStrategy(StrategyBase):
             return None
 
         # 4. 放量确认（成交量 >= volume_mult × 20 日均量）
-        avg_vol = float(df["volume"].iloc[-21:-1].mean())
-        if avg_vol == 0:
+        #    均量只跟**同口径**（IEX vs 合并量）的历史比。行情 pkl 在 2026-10-23
+        #    前后换过数据源，跨口径平均会把均量抬高一个数量级 → 量比被压到 0.0x
+        #    → 技术条件全过的票照样被误杀（实测 2026-11-17 有 9 只票如此丢掉信号）。
+        avg_vol = float(same_regime_volume_ma(df, window=20).iloc[-1])
+        if not (avg_vol > 0):          # NaN（历史不足）也算不通过
             return None
         vol_ratio = float(df["volume"].iloc[-1]) / avg_vol
-        if vol_ratio < self.volume_mult:
+        if not vol_ratio >= self.volume_mult:
             return None
 
         breakout_pct = (current - pivot) / pivot

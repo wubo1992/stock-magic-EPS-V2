@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from data.daily_bars import same_regime_volume_ma
+
 # ──────────────────────────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────────────────────────
@@ -159,7 +161,10 @@ def find_stage2_signals(df: pd.DataFrame) -> pd.DatetimeIndex:
     cond_breakout = close >= rolling_max * (1 + MIN_BREAKOUT_PCT)
 
     # 4. 量能 >= 1.5x 20日均量
-    avg_vol = volume.shift(1).rolling(20).mean()
+    #    均量只跟**同口径**（IEX vs 合并量）的历史比：行情 pkl 在 2026-10-23
+    #    前后换过数据源，两种口径量差 20~50 倍，跨口径平均会把均量抬高一个
+    #    数量级 → 量比被压到 0.0x → 回测里那几天的 Stage 2 触发日被凭空抹掉。
+    avg_vol = same_regime_volume_ma(df, window=20)
     cond_vol = (volume >= avg_vol * VOLUME_MULT) & (avg_vol > 0)
 
     all_pass = cond_trend & cond_above & cond_breakout & cond_vol

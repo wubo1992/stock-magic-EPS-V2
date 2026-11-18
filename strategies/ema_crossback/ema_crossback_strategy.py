@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from data.daily_bars import dedup_daily_bars
+from data.daily_bars import dedup_daily_bars, same_regime_volume_ma
 from data.fetcher import fetch
 from data.rs import compute_rs
 from data.split_guard import has_split_gap
@@ -69,7 +69,10 @@ def _prepare_crossback_frame(
     df = df.copy()
     df["ema10"] = df["close"].ewm(span=ema_period, adjust=False).mean()
     # shift(1)：今日成交量 ÷ 过去 20 日均量（不含今日）
-    df["avg_vol_20"] = df["volume"].rolling(vol_lookback).mean().shift(1)
+    # 均量只跟**同口径**（IEX vs 合并量）的历史比：行情 pkl 在 2026-10-23 前后
+    # 换过数据源，两种口径的量差 20~50 倍，跨口径平均会把量比压到 0.0x
+    # → 条件③ 永远不成立，合格的上穿被误杀（实测 watchlist 里 7 只票中招）。
+    df["avg_vol_20"] = same_regime_volume_ma(df, vol_lookback)
 
     # tz-aware fix: signal_date 可能是 tz-naive Timestamp（如 YYYY-MM-DD 字符串），
     # 但 df.index 可能是 tz-aware UTC（如 fetch 拿到的实盘数据）。比较前需统一。
@@ -162,7 +165,7 @@ def detect_crossback(
     # 条件 ③：穿回当日必须放量（量比 ≥ vol_mult × 20 日均量）
     signals = []
     for ev in _scan_crossback_events(frame):
-        if ev["volume_ratio"] < vol_mult:
+        if not (ev["volume_ratio"] >= vol_mult):   # NaN 也算不通过
             continue
         ev["strength"] = _crossback_strength(ev["volume_ratio"])
         signals.append(ev)

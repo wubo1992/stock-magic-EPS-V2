@@ -45,7 +45,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.daily_bars import dedup_daily_bars  # noqa: E402
+from data.daily_bars import (  # noqa: E402
+    dedup_daily_bars,
+    same_regime_sample_count,
+    same_regime_volume_ma,
+)
 from data.fundamentals import format_eps_value  # noqa: E402
 from data.stage import LABELS, STAGE_NAMES, StageResult, compute_stage  # noqa: E402
 
@@ -194,7 +198,9 @@ def _compute_metrics(df: pd.DataFrame, symbol: str) -> Metrics | None:
     vol = avg20 = vol_ratio = None
     if vols is not None and n >= 21:
         vol = float(vols.iloc[-1])
-        avg20 = float(vols.iloc[-21:-1].mean())
+        # 均量口径与策略保持一致：只跟**同口径**（IEX vs 合并量）的历史比
+        avg20_val = same_regime_volume_ma(d, window=20).iloc[-1]
+        avg20 = float(avg20_val) if pd.notna(avg20_val) else None
         vol_ratio = (vol / avg20) if avg20 else None
 
     pivot = breakout = None
@@ -446,8 +452,9 @@ class BlockedCrossback:
     data_day: str          # 最后一根 bar 的日期
     blocked_by: list[str]  # 卡住的条件编号（②/③/④）
     details: dict[str, str]
-    volume_ratio_same: float | None = None   # 同源口径的量比（数据源换挡时才是真的）
     vol_scale_broken: bool = False           # 20 日均量混了两个量纲 → 量比失真
+    vol_same_samples: int | None = None      # 量比用了多少根同口径 bar 算出来的
+    vol_window: int = 20                     # 量比的窗口长度（根）
 
 
 @dataclass
@@ -695,8 +702,8 @@ def _diagnose_blocked_crossbacks(
         if diag["days_since"] > horizon:
             continue
         info = universe.get(symbol, {}) if isinstance(universe, dict) else {}
-        # 量比是不是被「数据源换挡」压假了？（20 日均量混了两个量纲 → 条件③ 误杀）
-        same_ratio, broken = _same_source_volume_ratio(df, diag["date"])
+        # 量比是用多少根**同口径** bar 算出来的？不足 20 根 = 文件跨了数据源换挡
+        same_samples, broken = _volume_regime_note(df, diag["date"])
         out.append(
             BlockedCrossback(
                 symbol=symbol,
@@ -709,8 +716,8 @@ def _diagnose_blocked_crossbacks(
                 data_day=diag["data_day"].isoformat(),
                 blocked_by=list(diag["blocked_by"]),
                 details={c["id"]: c["detail"] for c in diag["checks"]},
-                volume_ratio_same=same_ratio,
                 vol_scale_broken=broken,
+                vol_same_samples=same_samples,
             )
         )
     # 排序：先按「被几条条件挡住」（挡得越少越接近成交），再按距今天数
@@ -718,18 +725,20 @@ def _diagnose_blocked_crossbacks(
     return out
 
 
-def _same_source_volume_ratio(df: pd.DataFrame, event_ts: pd.Timestamp) -> tuple[float | None, bool]:
-    """同源口径的量比 + 是否发生**数据源换挡**。
+def _volume_regime_note(df: pd.DataFrame, event_ts: pd.Timestamp) -> tuple[int | None, bool]:
+    """量比的口径说明：同源样本数 + 是否跨了数据源换挡。
 
     行情 pkl 在 2026-10-23 前后换过源：之前是「合并量」bar（00:00 UTC，量是全市场），
     之后只剩「IEX」bar（04:00/05:00 UTC，量小 1~3 个数量级）。
     同一天两根 bar 的情况 `dedup_daily_bars` 能处理（留最晚那根），但**跨日期换源**处理不了：
     20 日均量把两个量纲混在一起 → 量比被压到 0.0x → 条件③ 永远不成立（真信号被误杀）。
 
-    监控池 113 只里现在有 5 只踩在这个断档上（NCPL 643x / IMCC 3040x / ESP 26x / FDBC 19x / SEER 4x）。
+    策略层已改成「只跟同口径比」（`data/daily_bars.same_regime_volume_ma`），
+    所以引擎给出的量比就是同源口径的读数。这里只补充**样本数**：
+    不足 20 根 → 这个文件的量窗跨了换挡，读数要打折看。
 
     Returns:
-        (同源量比 or None, 是否换挡)
+        (同源样本数 or None, 是否跨了换挡)
     """
     d = dedup_daily_bars(df)
     if d is None or d.empty:
@@ -741,34 +750,11 @@ def _same_source_volume_ratio(df: pd.DataFrame, event_ts: pd.Timestamp) -> tuple
     if pos < 0:
         return None, False
 
-    window = d.iloc[max(0, pos - 29):pos + 1]
-    if len(window) < 10:
-        return None, False
-    hours = set(window.index.hour)
-    if len(hours) < 2:
-        return None, False
-
-    vol = window["volume"].astype(float)
-    pre = vol.iloc[:5].median()
-    post = vol.iloc[-5:].median()
-    if not pre or not post or pre / post <= 3:
-        return None, False
-
-    # 同源 = 与事件同一时间戳小时的历史 bar
-    same = d[d.index.hour == event_ts.hour]
-    try:
-        spos = same.index.get_indexer([event_ts], method="nearest")[0]
-    except Exception:
-        return None, True
-    if spos < 5:
-        return None, True
-    win = same.iloc[max(0, spos - 20):spos]["volume"].astype(float)
-    if len(win) < 5:
-        return None, True
-    avg = float(win.mean())
-    if not avg:
-        return None, True
-    return float(same.iloc[spos]["volume"]) / avg, True
+    counts = same_regime_sample_count(d, window=20)
+    sample = counts.iloc[pos]
+    same_samples = int(sample) if pd.notna(sample) else None
+    broken = same_samples is not None and same_samples < 20
+    return same_samples, broken
 
 
 def _spy_vol_label(spy) -> str:
@@ -1232,10 +1218,10 @@ def _blocked_cross_row(b: BlockedCrossback) -> str:
     why = "；".join(b.details.get(cid, "") for cid in b.blocked_by)
     if b.vol_scale_broken:
         vol_cell = f"{b.volume_ratio:.2f}x ⚠量纲失真"
-        if b.volume_ratio_same is not None:
-            vol_cell += f"（同源 {b.volume_ratio_same:.2f}x）"
+        if b.vol_same_samples is not None:
+            vol_cell += f"（同源样本 {b.vol_same_samples}/{b.vol_window}）"
         else:
-            vol_cell += "（同源量比算不出）"
+            vol_cell += "（同源样本数算不出）"
     else:
         vol_cell = f"{b.volume_ratio:.2f}x"
     cells = [
@@ -1534,8 +1520,10 @@ def render_markdown(data: ReportData, today: date) -> str:
         w("")
         if any(b.vol_scale_broken for b in d.blocked_cross):
             w("> ⚠ **量纲失真**：行情 pkl 在 2026-10-23 前后换过数据源（合并量 bar → IEX bar），"
-              "换挡那几天算的 20 日均量混了两个量纲 → 量比被压到 0.0x。"
-              "括号里是**同源口径**的真实量比 —— 判 ③ 时该看这个数。")
+              "这些票的 20 日均量窗口跨了换挡 → 均量里混了两个量纲。"
+              "括号里的「同源样本 N/20」= 这个量比实际用了多少根**同口径** bar"
+              "（不足 20 根说明均量掺了另一个量纲，读数要打折）。"
+              "量比本身已按**同源口径**给出，判 ③ 直接看这个数。")
             w("")
     else:
         w("> 监控池里近两周没有「上穿过 EMA10 但没过协议」的票 —— "
