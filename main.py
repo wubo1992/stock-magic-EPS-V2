@@ -314,6 +314,8 @@ def run_live(config: dict, strategy_arg: str | None) -> None:
             today=today,
             recent_pnl=recent_pnl,
             cache_dir=Path("data/cache"),
+            # 「过去 10 天信号收益追踪」表要带 RS —— 复用同一套 compute_rs
+            rs_compute=make_rs_refresher(market_data),
         )
         if cb_report_path:
             print(f"[报告] Crossback 报告：{cb_report_path}")

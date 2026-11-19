@@ -455,6 +455,13 @@ class BlockedCrossback:
     vol_scale_broken: bool = False           # 20 日均量混了两个量纲 → 量比失真
     vol_same_samples: int | None = None      # 量比用了多少根同口径 bar 算出来的
     vol_window: int = 20                     # 量比的窗口长度（根）
+    stage: StageResult | None = None         # Weinstein 当前阶段
+    rs_rating: float | None = None           # O'Neil RS Rating（1-99）
+    rs_spy: float | None = None
+    rs_10w: float | None = None
+    rs_10d: float | None = None
+    sector: str | None = None                # GICS 一级行业
+    sector_rank: str | None = None           # 板块内排名「42/664」
 
 
 @dataclass
@@ -642,11 +649,61 @@ def _load_crossback_config() -> dict:
     return section if isinstance(section, dict) else {}
 
 
+def _signal_rs_lookup(records: list[dict]) -> dict[str, list[tuple[str, dict]]]:
+    """股票 -> [(日期, 信号记录)]（按日期升序）。
+
+    「被协议挡掉的票」**没有** crossback 记录（信号根本没发出来），
+    但它当初是 v_eps_v2 第一层信号进的监控池 —— 那条记录里就有 RS 四列
+    + 板块排名。取同一条记录 = 跟第一层/第二层表里的 RS 完全是同一个口径。
+    """
+    out: dict[str, list[tuple[str, dict]]] = {}
+    for r in records:
+        sym = (r.get("股票") or "").strip()
+        day = (r.get("日期") or "").strip()
+        if not sym or not day:
+            continue
+        out.setdefault(sym, []).append((day, r))
+    for rows in out.values():
+        rows.sort(key=lambda x: x[0])
+    return out
+
+
+def _pick_signal_record(
+    lookup: dict[str, list[tuple[str, dict]]],
+    symbol: str,
+    signal_date: str,
+    date_str: str,
+) -> dict | None:
+    """取这只票的信号记录 —— 优先**最近一条带 RS 的记录**。
+
+    为什么不是按监控池记的信号日精确匹配：那条老记录常常没回填 RS（空值），
+    照抄会渲染成「—」，而这只票后来的 crossback 记录里明明有 RS。
+    现场（2026-11-18）：NCPL 监控池信号日 2026-10-19 那条没 RS，
+    但 10-22 / 11-10 的 crossback 记录有（99 / 87）。
+
+    报告日之后的记录一律不看 —— 那是偷看未来。
+    """
+    rows = lookup.get(symbol)
+    if not rows:
+        return None
+    exact = None
+    with_rs = None
+    for day, rec in rows:
+        if day > date_str:
+            continue
+        if day == signal_date and exact is None:
+            exact = rec
+        if _num(rec, "RS相对强度") is not None:
+            with_rs = rec          # rows 已按日期升序 → 最后一条就是最近的
+    return with_rs or exact
+
+
 def _diagnose_blocked_crossbacks(
     watchlist: dict,
     cache_dir: Path,
     date_str: str,
     universe: dict,
+    rs_lookup: dict[str, list[tuple[str, dict]]] | None = None,
 ) -> list[BlockedCrossback]:
     """监控池里「上穿过 EMA10 但没发出信号」的票 —— 逐条说清卡在哪个条件。
 
@@ -704,6 +761,25 @@ def _diagnose_blocked_crossbacks(
         info = universe.get(symbol, {}) if isinstance(universe, dict) else {}
         # 量比是用多少根**同口径** bar 算出来的？不足 20 根 = 文件跨了数据源换挡
         same_samples, broken = _volume_regime_note(df, diag["date"])
+        # 阶段：判**当前**处于哪个阶段（跟第一层/第二层表同一口径）
+        try:
+            stage = compute_stage(df)
+        except Exception:
+            stage = None
+        # RS：这只票没有 crossback 记录，从它当初的第一层信号记录里取
+        rs_rating = rs_spy = rs_10w = rs_10d = None
+        sector_rank = None
+        rec = _pick_signal_record(
+            rs_lookup or {}, symbol, str(entry.get("signal_date") or ""), date_str
+        )
+        if rec is not None:
+            rs_rating = _num(rec, "RS相对强度")
+            rs_spy = _num(rec, "RS/SPY")
+            rs_10w = _num(rec, "RS-10W")
+            rs_10d = _num(rec, "RS-10D")
+            sector_rank = (rec.get("板块排名") or "").strip() or None
+            if sector_rank in ("", "—"):
+                sector_rank = None
         out.append(
             BlockedCrossback(
                 symbol=symbol,
@@ -718,6 +794,13 @@ def _diagnose_blocked_crossbacks(
                 details={c["id"]: c["detail"] for c in diag["checks"]},
                 vol_scale_broken=broken,
                 vol_same_samples=same_samples,
+                stage=stage,
+                rs_rating=rs_rating,
+                rs_spy=rs_spy,
+                rs_10w=rs_10w,
+                rs_10d=rs_10d,
+                sector=info.get("gics_sector"),
+                sector_rank=sector_rank,
             )
         )
     # 排序：先按「被几条条件挡住」（挡得越少越接近成交），再按距今天数
@@ -857,7 +940,9 @@ def _collect(date_str: str, signals_csv: Path, watchlist_path: Path, cache_dir: 
         universe=universe,
         sectors=sectors,
         rs_pool=_rs_pool_info(PROJECT_ROOT, date_str),
-        blocked_cross=_diagnose_blocked_crossbacks(watchlist, cache_dir, date_str, universe),
+        blocked_cross=_diagnose_blocked_crossbacks(
+            watchlist, cache_dir, date_str, universe, _signal_rs_lookup(records)
+        ),
     )
     data.today_main.sort(key=lambda v: -(v.rs_rating or 0))
     data.history_main.sort(key=lambda v: v.date, reverse=True)
@@ -921,6 +1006,8 @@ FIELD_GLOSSARY = [
 CROSSBACK_GLOSSARY = [
     ("信号日期 / 回踩日", "回踩**实际发生**的那根 K 线日期（数据日），不是运行日",
      "执行时点与主策略一样 = 下一个美股开盘"),
+    ("阶段", "Weinstein 四阶段里该股**当前**处于哪个阶段（周线 + 30 周均线 + 高低点结构）",
+     "回踩协议不看阶段，买入要看：Stage 3/4 是「该走了」，别在退潮段接回踩"),
     ("距今", "回踩日距**数据日**多少个交易日",
      "新鲜度闸门：>7 天视为过期，不作为行动依据（第二层协议条件④）"),
     ("触发收盘", "回踩当天的**真实收盘价**（从行情缓存按该日 bar 取）",
@@ -1227,11 +1314,18 @@ def _blocked_cross_row(b: BlockedCrossback) -> str:
     cells = [
         f"**{b.symbol}**",
         b.name or "—",
+        _format_stage_cell(b.stage),
         b.date,
         vol_cell,
         vs,
         f"{b.days_since} 天",
         "**" + " ".join(b.blocked_by) + "**",
+        f"{int(b.rs_rating)}" if b.rs_rating is not None else "—",
+        _x(b.rs_spy),
+        _x(b.rs_10w),
+        _x(b.rs_10d),
+        b.sector or "—",
+        b.sector_rank or "—",
         why,
     ]
     return "| " + " | ".join(cells) + " |"
@@ -1513,8 +1607,10 @@ def render_markdown(data: ReportData, today: date) -> str:
         w("> 按「挡得少 → 距今近」排序：最上面那几只是**差一点就能进**的。"
           f"「距今」按**自然日**、相对报告日 {d.date_str} 算（协议条件④用的就是自然日）。")
         w("")
-        w("| 股票 | 公司 | 上穿日 | 上穿量比 | 现价 vs EMA10 | 距今 | 卡在 | 说明 |")
-        w("|------|------|--------|----------|---------------|------|------|------|")
+        w("| 股票 | 公司 | 阶段 | 上穿日 | 上穿量比 | 现价 vs EMA10 | 距今 | 卡在 "
+          "| RS | RS/SPY | 10W | 10D | 板块 | 板块排名 | 说明 |")
+        w("|------|------|------|--------|----------|---------------|------|------"
+          "|----|--------|-----|-----|------|---------|------|")
         for b in d.blocked_cross:
             w(_blocked_cross_row(b))
         w("")
@@ -1853,7 +1949,11 @@ def build_paste_block(data: ReportData) -> str:
         parts = []
         for b in data.blocked_cross[:6]:
             detail = "，".join(b.details.get(cid, "") for cid in b.blocked_by)
-            parts.append(f"{b.symbol} 卡 {' '.join(b.blocked_by)}（{detail}）")
+            tag = _format_stage_cell(b.stage, bold=False)
+            rs_tag = f"RS {int(b.rs_rating)}" if b.rs_rating is not None else "RS —"
+            parts.append(
+                f"{b.symbol}（{tag}，{rs_tag}）卡 {' '.join(b.blocked_by)}（{detail}）"
+            )
         lines.append(f"**回踩（今日 0 个，被协议挡掉）**：" + "；".join(parts))
         lines.append("")
     spy = data.market.get("spy")

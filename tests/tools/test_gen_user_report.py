@@ -929,3 +929,205 @@ def test_scale_break_note_matches_the_cell_format(blocked_env):
     assert notes, f"没找到量纲失真的脚注：\n{md}"
     assert "同源样本" in notes[0], f"脚注没解释括号里的同源样本数：{notes[0]}"
     assert "真实量比" not in notes[0], f"脚注还在把括号说成另一个量比：{notes[0]}"
+
+
+# ---------------------------------------------------------------------------
+# 第二层「被协议挡掉的票」必须带阶段和 RS
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def blocked_stage_env(tmp_path: Path) -> dict:
+    """一只「Stage 2 里上穿过 EMA10、但量能不足被挡」的监控票。
+
+    形状：45 周筑底 + 25 周主升（= Stage 2）→ 回调 2 天跌破 EMA10 →
+    最后一天量能不足地站回 EMA10 → 条件③ 把这只票挡住。
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    weekly = [50.0] * 45 + [50.0 * (1.02 ** (i + 1)) for i in range(25)]
+    closes: list[float] = []
+    for w in weekly:
+        closes.extend([w] * 5)
+    p = closes[-1]
+    closes.append(p * 0.98)              # 跌破 EMA10
+    closes.append(p * 0.98 * 1.05)        # 站回 EMA10，但量能不足
+    n = len(closes)
+    vols = [100_000] * n
+    vols[-1] = 50_000                     # 量比 0.5x → 条件③ 不成立
+    dates = pd.date_range(end="2026-11-05", periods=n, freq="B", tz="UTC")
+    pd.to_pickle(
+        pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c * 1.005 for c in closes],
+                "low": [c * 0.995 for c in closes],
+                "close": closes,
+                "volume": vols,
+            },
+            index=dates,
+        ),
+        cache / "BLOCKED.pkl",
+    )
+    pd.to_pickle(_make_bars(200, close=700.0, volume=1_000_000), cache / "SPY.pkl")
+
+    csv_path = tmp_path / "signals.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerow({
+            "日期": "2026-08-01", "股票": "BLOCKED", "信号": "买入",
+            "信号类型": "v_eps_v2_buy", "强度(1-5)": "3",
+            "触发原因": "[EPS] 最新季度EPS$0.50", "参考止损": "$46.00",
+            "RS相对强度": "88", "RS/SPY": "1.05", "RS-10W": "1.20", "RS-10D": "0.90",
+            "板块排名": "42/664",
+        })
+
+    wl_path = tmp_path / "watchlist.json"
+    wl_path.write_text(json.dumps({
+        "BLOCKED": {
+            "symbol": "BLOCKED", "signal_date": "2026-08-01", "signal_price": 50.0,
+            "stage2_stop": 46.0, "added_at": "2026-08-01T01:25:25+00:00",
+            "expires_at": "2026-12-01T01:25:25+00:00",
+            "crossback_count": 0, "last_crossback_date": None,
+        },
+    }), encoding="utf-8")
+
+    uni_path = tmp_path / "rs_universe.json"
+    uni_path.write_text(json.dumps({
+        "symbols": {"BLOCKED": {"name": "Blocked Inc", "gics_sector": "Information Technology"}}
+    }), encoding="utf-8")
+
+    return {
+        "signals_csv": csv_path, "watchlist": wl_path, "cache_dir": cache,
+        "universe": uni_path, "date": "2026-11-06",
+    }
+
+
+def _blocked_section(md: str) -> str:
+    return md.split("被协议挡掉的票", 1)[1].split("\n## ")[0]
+
+
+def test_blocked_candidates_carry_stage_and_rs_columns(blocked_stage_env):
+    """「被协议挡掉的票」必须带阶段列 + RS 四列 + 板块排名。
+
+    这批票是「差一点就能进」的机会 —— 没有 RS 就不知道这是不是市场里的强者，
+    没有阶段就不知道它现在还在不在 Stage 2（回踩协议不看阶段，买入要看）。
+    """
+    md = build_user_report(
+        date_str=blocked_stage_env["date"], signals_csv=blocked_stage_env["signals_csv"],
+        watchlist_path=blocked_stage_env["watchlist"], cache_dir=blocked_stage_env["cache_dir"],
+        universe_path=blocked_stage_env["universe"],
+    )
+    section = _blocked_section(md)
+    header = [ln for ln in section.splitlines() if ln.startswith("| 股票")]
+    assert header, f"被挡掉的票表没有表头：\n{section}"
+    for col in ("阶段", "RS", "RS/SPY", "10W", "10D", "板块排名"):
+        assert f"| {col}" in header[0], f"被挡掉的票表缺「{col}」列：{header[0]}"
+
+
+def test_blocked_candidate_row_shows_stage_and_rs_values(blocked_stage_env):
+    """阶段和 RS 必须是**真值**（从行情和信号流水推出来），不是空占位。"""
+    md = build_user_report(
+        date_str=blocked_stage_env["date"], signals_csv=blocked_stage_env["signals_csv"],
+        watchlist_path=blocked_stage_env["watchlist"], cache_dir=blocked_stage_env["cache_dir"],
+        universe_path=blocked_stage_env["universe"],
+    )
+    section = _blocked_section(md)
+    row = [ln for ln in section.splitlines() if ln.startswith("| **BLOCKED**")]
+    assert row, f"被挡掉的候选没进表：\n{section}"
+    r = row[0]
+    assert "Stage 2" in r, f"没显示 Weinstein 阶段：{r}"
+    assert "88" in r, f"没显示 RS Rating：{r}"
+    assert "1.05x" in r, f"没显示 RS/SPY：{r}"
+    assert "1.20x" in r, f"没显示 10W：{r}"
+    assert "0.90x" in r, f"没显示 10D：{r}"
+    assert "42/664" in r, f"没显示板块排名：{r}"
+
+
+def test_paste_block_shows_stage_and_rs_for_blocked_candidates(blocked_stage_env):
+    """贴片段落是每天直接贴给用户看的东西 —— 「差一点就能进」的票要带阶段和 RS。"""
+    from datetime import date as _date
+
+    from tools.gen_user_report import _collect, build_paste_block
+
+    data = _collect(
+        blocked_stage_env["date"], blocked_stage_env["signals_csv"], blocked_stage_env["watchlist"],
+        blocked_stage_env["cache_dir"], blocked_stage_env["universe"], 7,
+        _date.fromisoformat(blocked_stage_env["date"]),
+    )
+    block = build_paste_block(data)
+    assert "Stage 2" in block, f"贴片段落里没有阶段：\n{block}"
+    assert "RS 88" in block, f"贴片段落里没有 RS Rating：\n{block}"
+
+
+def test_blocked_glossary_documents_stage_and_rs(blocked_stage_env):
+    """段 1.5 字段说明必须覆盖新加的阶段和 RS 列。"""
+    md = build_user_report(
+        date_str=blocked_stage_env["date"], signals_csv=blocked_stage_env["signals_csv"],
+        watchlist_path=blocked_stage_env["watchlist"], cache_dir=blocked_stage_env["cache_dir"],
+        universe_path=blocked_stage_env["universe"],
+    )
+    glossary = md.split("段 1.5 字段说明")[1].split("\n## ")[0]
+    for name in ("阶段", "RS", "RS/SPY", "10W", "10D", "板块排名"):
+        assert f"**{name}**" in glossary, f"段 1.5 字段说明缺「{name}」：\n{glossary}"
+
+
+def _append_signal_row(env: dict, row: dict) -> None:
+    with open(env["signals_csv"], encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.append(row)
+    with open(env["signals_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def test_blocked_candidate_uses_latest_record_that_has_rs(blocked_stage_env):
+    """取 RS 要用**最近一条带 RS 的记录**，不是监控池记的那条信号日。
+
+    现场（2026-11-18）：NCPL 的监控池信号日是 2026-10-19，那条老记录没回填 RS
+    （空值）→ 直接按信号日取会渲染成「—」。但它 10-22 和 11-10 的 crossback
+    记录都带 RS（99 / 87），取最近的一条才对。
+    """
+    _append_signal_row(blocked_stage_env, {
+        "日期": "2026-11-05", "股票": "BLOCKED", "信号": "买入",
+        "信号类型": "crossback_buy", "强度(1-5)": "3",
+        "触发原因": "[EMA10回踩] 上穿EMA10($50.00, +1.5%) + 量能0.5x均量",
+        "参考止损": "$46.00",
+        "RS相对强度": "87", "RS/SPY": "2.10", "RS-10W": "1.30", "RS-10D": "1.11",
+        "板块排名": "7/664",
+    })
+
+    md = build_user_report(
+        date_str=blocked_stage_env["date"], signals_csv=blocked_stage_env["signals_csv"],
+        watchlist_path=blocked_stage_env["watchlist"], cache_dir=blocked_stage_env["cache_dir"],
+        universe_path=blocked_stage_env["universe"],
+    )
+    row = [ln for ln in _blocked_section(md).splitlines() if ln.startswith("| **BLOCKED**")]
+    assert row, f"被挡掉的候选没进表：\n{_blocked_section(md)}"
+    r = row[0]
+    assert "87" in r, f"没取到最近一条带 RS 的记录：{r}"
+    assert "2.10x" in r, f"没取到最近一条的 RS/SPY：{r}"
+    assert "7/664" in r, f"没取到最近一条的板块排名：{r}"
+
+
+def test_blocked_candidate_ignores_records_after_the_report_date(blocked_stage_env):
+    """报告日之后才有的记录不能拿来算 RS —— 那是偷看未来。"""
+    _append_signal_row(blocked_stage_env, {
+        "日期": "2026-12-01", "股票": "BLOCKED", "信号": "买入",
+        "信号类型": "crossback_buy", "强度(1-5)": "3",
+        "触发原因": "[EMA10回踩] 上穿EMA10($50.00, +1.5%) + 量能0.5x均量",
+        "参考止损": "$46.00",
+        "RS相对强度": "99", "RS/SPY": "9.99", "RS-10W": "9.99", "RS-10D": "9.99",
+        "板块排名": "1/664",
+    })
+
+    md = build_user_report(
+        date_str=blocked_stage_env["date"], signals_csv=blocked_stage_env["signals_csv"],
+        watchlist_path=blocked_stage_env["watchlist"], cache_dir=blocked_stage_env["cache_dir"],
+        universe_path=blocked_stage_env["universe"],
+    )
+    row = [ln for ln in _blocked_section(md).splitlines() if ln.startswith("| **BLOCKED**")]
+    assert row, f"被挡掉的候选没进表：\n{_blocked_section(md)}"
+    assert "99" not in row[0], f"偷看了报告日之后的记录：{row[0]}"
+    assert "88" in row[0], f"该用报告日之前那条记录的 RS：{row[0]}"

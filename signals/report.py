@@ -245,9 +245,7 @@ def _load_cached_df(symbol: str, cache_dir) -> "object | None":
 
 def _stage_text(symbol: str, cache_dir) -> str:
     """当前 Weinstein 阶段（一行说明）—— 判不出来就说算不出来，不编。"""
-    if cache_dir is None:
-        return "—"
-    df = _load_cached_df(symbol, cache_dir)
+    df = _load_cached_df(symbol, cache_dir or DEFAULT_CACHE_DIR)
     if df is None:
         return "—"
     try:
@@ -258,6 +256,35 @@ def _stage_text(symbol: str, cache_dir) -> str:
         return f"—（{result.reason}）"
     substage = f" · {result.substage}" if result.substage else ""
     return f"{result.label}{substage} —— {result.reason}"
+
+
+def _stage_cell_short(symbol: str, cache_dir) -> str:
+    """表格单元格里的阶段 —— 只要「Stage N 子阶段」，不要后面的理由。
+
+    回踩协议不看阶段，但**买入要看**：Stage 3/4 是「该走了」的阶段，
+    接回去就是接飞刀。这两个阶段加标记，一眼看见。
+
+    `cache_dir=None` 走默认行情目录（data/cache）—— 与 `generate_daily_report`
+    的文档一致（"cache_dir: None = data/cache"）。早先这里直接返回「—」，
+    结果 main.py 的日报调用没传 cache_dir，第二层回踩表的阶段列整列是「—」。
+    """
+    df = _load_cached_df(symbol, cache_dir or DEFAULT_CACHE_DIR)
+    if df is None:
+        return "—"
+    try:
+        result = compute_stage(df)
+    except Exception:
+        return "—"
+    if result.stage is None:
+        return "—"
+    text = result.label
+    if result.substage:
+        text = f"{text} · {result.substage}"
+    if result.stage == 3:
+        return text + " ⚠"
+    if result.stage == 4:
+        return text + " 🔴"
+    return text
 
 
 def compute_recent_signal_pnl(watchlist: dict, today: datetime, cache_dir=None) -> list[dict]:
@@ -308,20 +335,37 @@ def compute_recent_signal_pnl(watchlist: dict, today: datetime, cache_dir=None) 
     return rows
 
 
-def _build_recent_pnl_section(recent_pnl: list[dict]) -> list[str]:
-    """生成"过去 10 天信号收益追踪"Markdown 区段。"""
+def _build_recent_pnl_section(
+    recent_pnl: list[dict],
+    cache_dir=None,
+    rs_compute=None,
+) -> list[str]:
+    """生成"过去 10 天信号收益追踪"Markdown 区段。
+
+    阶段和 RS 一起给出来：光看价格和收益率判断不了「这只票是强是弱、
+    现在还在不在 Stage 2」。
+    """
     lines = ["", "### 过去 10 天信号收益追踪", ""]
     if not recent_pnl:
         lines.append("过去 10 天无触发信号。")
         lines.append("")
         return lines
-    lines.append("| 股票 | 信号日期 | 信号价 | 最新价 | 收益率 |")
-    lines.append("|------|----------|--------|--------|--------|")
+    lines.append("| 股票 | 信号日期 | 阶段 | 信号价 | 最新价 | 收益率 | RS |")
+    lines.append("|------|----------|------|--------|--------|--------|----|")
     for r in recent_pnl:
+        symbol = r["symbol"]
+        rs_cell = "—"
+        if rs_compute is not None:
+            try:
+                rs = rs_compute(symbol, r["signal_date"])
+            except Exception:
+                rs = None
+            if rs is not None and getattr(rs, "rs_rating", None) is not None:
+                rs_cell = str(rs.rs_rating)
         lines.append(
-            f"| {r['symbol']} | {r['signal_date']} "
+            f"| {symbol} | {r['signal_date']} | {_stage_cell_short(symbol, cache_dir)} "
             f"| ${r['signal_close']:.2f} | ${r['latest_close']:.2f} "
-            f"| {r['pnl_pct']:+.1f}% |"
+            f"| {r['pnl_pct']:+.1f}% | {rs_cell} |"
         )
     lines.append("")
     return lines
@@ -382,7 +426,7 @@ def generate_daily_report(
     # === Crossback 区段（spec §4.3） ===
     if crossback_records is not None or watchlist_status is not None:
         content += _build_crossback_section(crossback_records or [], watchlist_status or {},
-                                            cache_dir=cache_dir)
+                                            cache_dir=cache_dir, rs_compute=rs_compute)
 
     # === Watchlist EMA10 Crossback 状态（用户偏好：以后也把这种信号放到 livetest 报告里） ===
     if watchlist:
@@ -491,12 +535,13 @@ def _rs_mult_str(value: str) -> str:
 def _crossback_table(records: list[dict], cache_dir=None) -> list[str]:
     """第二层回踩表 —— 日报区段和独立回踩报告共用同一张表。
 
-    列与第一层对齐（RS 四列 + 板块排名）：回踩票同样是可执行的进场依据，
-    只给一个 RS Rating 看不出它在板块里排第几、是不是跑赢大盘。
+    列与第一层对齐（阶段 + RS 四列 + 板块排名）：回踩票同样是可执行的进场依据，
+    只给一个 RS Rating 看不出它在板块里排第几、是不是跑赢大盘；
+    阶段更要看 —— Stage 3/4 是退潮段，接回去就是接飞刀。
     """
     lines = [
-        "| 日期 | 距今 | 股票 | RS | RS/SPY | 10W | 10D | 板块排名 | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |",
-        "|------|------|------|----|--------|-----|-----|---------|------|----------|-----------|----------|------|---------|",
+        "| 日期 | 距今 | 股票 | 阶段 | RS | RS/SPY | 10W | 10D | 板块排名 | 强度 | 触发收盘 | 上穿 EMA10 | 参考止损 | 量比 | 上穿涨幅 |",
+        "|------|------|------|------|----|--------|-----|-----|---------|------|----------|-----------|----------|------|---------|",
     ]
     base_date = _latest_record_date(records)
     for r in records:
@@ -508,7 +553,8 @@ def _crossback_table(records: list[dict], cache_dir=None) -> list[str]:
         rs = _rs_columns(r)
         lines.append(
             f"| {r['日期']} | {_trading_days_since(r['日期'], base_date)} "
-            f"| {r['股票']} | {rs.get('RS相对强度') or '—'} "
+            f"| {r['股票']} | {_stage_cell_short(r.get('股票', ''), cache_dir)} "
+            f"| {rs.get('RS相对强度') or '—'} "
             f"| {_rs_mult_str(rs.get('RS/SPY'))} | {_rs_mult_str(rs.get('RS-10W'))} "
             f"| {_rs_mult_str(rs.get('RS-10D'))} | {rs.get('板块排名') or '—'} "
             f"| {r['强度星级']} "
@@ -519,10 +565,12 @@ def _crossback_table(records: list[dict], cache_dir=None) -> list[str]:
 
 
 def _build_crossback_section(crossback_records: list[dict], watchlist_status: dict,
-                              cache_dir=None) -> str:
+                              cache_dir=None, rs_compute=None) -> str:
     """生成第二层（EMA 10 回踩）区段 Markdown（spec §4.3）。"""
     lines = ["", "---", "",
-             "## 第二层：EMA 10 Crossback 信号（观察清单回踩 · 进场时机）", ""]
+             "## 第二层：EMA 10 Crossback 信号（观察清单回踩 · 进场时机）", "",
+             "> **阶段** = 该股**当前**的 Weinstein 阶段（按最新行情算）；"
+             "Stage 3 ⚠ / Stage 4 🔴 是退潮段 —— 回踩协议不看阶段，买入要看", ""]
 
     if crossback_records:
         lines += _crossback_table(crossback_records, cache_dir)
@@ -554,7 +602,8 @@ def _build_crossback_section(crossback_records: list[dict], watchlist_status: di
         if not watchlist_status.get("triggered_today"):
             recent_pnl = watchlist_status.get("recent_pnl")
             if recent_pnl:
-                lines += _build_recent_pnl_section(recent_pnl)
+                lines += _build_recent_pnl_section(recent_pnl, cache_dir=cache_dir,
+                                                   rs_compute=rs_compute)
 
     return "\n".join(lines)
 
@@ -686,6 +735,7 @@ def _build_report(today_str: str, today_records: list[dict], history: list[dict]
             "",
             "> 以下是本周内（不含今日）触发的买入信号的完整条件解读，",
             "> 供复盘和学习参考。",
+            "> **阶段** = 该股**当前**的 Weinstein 阶段（按最新行情算），不是信号发出那天的阶段。",
             "",
         ]
         for r in sorted(past_buys, key=lambda x: x.get("日期", ""), reverse=True):
@@ -1173,11 +1223,15 @@ def generate_crossback_report(
     today: datetime,
     recent_pnl: list | None = None,
     cache_dir=None,
+    rs_compute=None,
 ) -> Path | None:
     """生成独立的 EMA 10 Crossback 报告（spec §4.3）。
 
     输出路径：output/{strategy_id}/{YYYY-MM-DD}/报告_EMA10回踩_{YYYY-MM-DD}.md
     若 records 为空且 watchlist 也为空，返回 None（不生成）。
+
+    rs_compute: (symbol, date) -> RSResult|None，用于给「过去 10 天信号收益追踪」
+    表补 RS Rating。None = 不补（那一列显示 —）。
 
     Returns:
         Path | None：写入的报告文件路径；若不生成则返回 None
@@ -1203,6 +1257,8 @@ def generate_crossback_report(
     lines.append("- **上穿涨幅**：crossback 当日 close 相对 EMA10 的涨幅 (%)")
     lines.append("- **量比**：crossback 当日成交量 ÷ 过去 20 日均量")
     lines.append("- **强度**：1-5 ★（基于量能倍数）")
+    lines.append("- **阶段**：该股**当前**的 Weinstein 阶段（按最新行情算）；"
+                 "Stage 3 ⚠ / Stage 4 🔴 是退潮段 —— 回踩协议不看阶段，买入要看")
     lines.append("- **RS**：O'Neil RS Rating（全市场加权收益百分位 1-99，越高越强；"
                  "80 以上属 CAN SLIM 的合格区间）")
     lines.append("")
@@ -1248,7 +1304,8 @@ def generate_crossback_report(
     if not today_triggered:
         if recent_pnl is None and cache_dir is not None:
             recent_pnl = compute_recent_signal_pnl(watchlist, today, cache_dir)
-        lines += _build_recent_pnl_section(recent_pnl or [])
+        lines += _build_recent_pnl_section(recent_pnl or [], cache_dir=cache_dir,
+                                           rs_compute=rs_compute)
 
     if watchlist:
         lines.append("### 监控明细")

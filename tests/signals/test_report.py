@@ -693,3 +693,157 @@ def test_crossback_tables_carry_full_rs_columns(tmp_path):
         assert r.get("10W") == "1.20x", f"{label} 缺 10W：{header}"
         assert r.get("10D") == "0.90x", f"{label} 缺 10D：{header}"
         assert r.get("板块排名") == "42/664", f"{label} 缺板块排名：{header}"
+
+
+# --------------------------------------------------------------------------
+# 第二层缺阶段和 RS —— 回踩票同样要能判断「强不强、还在不在 Stage 2」
+# --------------------------------------------------------------------------
+def _write_stage2_cache(cache_dir, symbol: str, end: str = "2026-11-05") -> None:
+    """写一份**阶段可判定**的行情：45 周筑底 + 25 周主升 → Stage 2。
+
+    阶段判定跑在周线上，参考实现要求至少 60 根周线 —— 所以至少 70 周。
+    """
+    import pandas as pd
+
+    weekly = [50.0] * 45 + [50.0 * (1.02 ** (i + 1)) for i in range(25)]
+    closes: list[float] = []
+    for w in weekly:
+        closes.extend([w] * 5)
+    dates = pd.date_range(end=end, periods=len(closes), freq="B", tz="UTC")
+    pd.to_pickle(
+        pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c * 1.005 for c in closes],
+                "low": [c * 0.995 for c in closes],
+                "close": closes,
+                "volume": 100_000,
+            },
+            index=dates,
+        ),
+        cache_dir / f"{symbol}.pkl",
+    )
+
+
+class _FakeRS:
+    def __init__(self, rating: int):
+        self.rs_rating = rating
+
+
+def test_crossback_table_carries_stage_column(tmp_path):
+    """第二层回踩表必须有阶段列 —— 回踩协议不看阶段，但买入要看。
+
+    回踩发生时 Stage 3/4 的票已经退潮了，接回去就是接飞刀。
+    """
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+    from signals.report import generate_crossback_report
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_stage2_cache(cache, "CYPH")
+
+    records = [{
+        "日期": "2026-11-05", "股票": "CYPH", "信号": "买入", "信号类型": "crossback_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$48.00",
+        "触发原因": "[EMA10回踩] 上穿EMA10($49.00, +1.5%) + 量能2.5x均量",
+        "RS相对强度": "88", "RS/SPY": "1.05", "RS-10W": "1.20", "RS-10D": "0.90",
+        "板块排名": "42/664",
+    }]
+
+    original = report_mod.OUTPUT_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    try:
+        path = generate_crossback_report(
+            records=records, watchlist={}, strategy_id="v_eps_v2",
+            today=datetime(2026, 11, 6, tzinfo=timezone.utc), cache_dir=cache,
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original
+
+    content = path.read_text(encoding="utf-8")
+    header, rows = _md_table(content.split("## 第二层：Crossback 信号")[1])
+    assert "阶段" in header, f"回踩表缺阶段列：{header}"
+    row = [r for r in rows if r.get("股票") == "CYPH"]
+    assert row, f"回踩表里没有 CYPH：{header}"
+    assert row[0].get("阶段", "").startswith("Stage 2"), \
+        f"阶段没算出来：{row[0].get('阶段')}"
+
+
+def test_recent_pnl_section_carries_stage_and_rs(tmp_path):
+    """「过去 10 天信号收益追踪」表要带阶段和 RS。
+
+    以前只有价格和收益率 —— 看不出这只票是强是弱、还在不在 Stage 2。
+    """
+    import pandas as pd
+
+    from signals.report import _build_recent_pnl_section
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_stage2_cache(cache, "CRDL")
+
+    recent_pnl = [{
+        "symbol": "CRDL", "signal_date": "2026-11-05",
+        "signal_close": 50.0, "latest_close": 52.0, "pnl_pct": 4.0,
+    }]
+
+    lines = _build_recent_pnl_section(
+        recent_pnl, cache_dir=cache, rs_compute=lambda sym, day: _FakeRS(91)
+    )
+    text = "\n".join(lines)
+    header, rows = _md_table(text)
+    assert "阶段" in header, f"收益追踪表缺阶段列：{header}"
+    assert "RS" in header, f"收益追踪表缺 RS 列：{header}"
+    row = [r for r in rows if r.get("股票") == "CRDL"]
+    assert row, f"收益追踪表里没有 CRDL：{header}"
+    assert row[0].get("阶段", "").startswith("Stage 2"), \
+        f"阶段没算出来：{row[0].get('阶段')}"
+    assert row[0].get("RS") == "91", f"RS 没渲染：{row[0]}"
+
+
+def test_daily_report_crossback_stage_falls_back_to_default_cache(tmp_path):
+    """不传 cache_dir 时，阶段要从默认行情目录取，而不是显示「—」。
+
+    generate_daily_report 的文档写的就是「cache_dir: None = data/cache」。
+    main.py 的日报调用**没传** cache_dir，结果第二层回踩表的阶段列整列是「—」
+    —— 用户看到的就是「第二层信号没有显示 stage」。
+
+    这里锁住回落行为：默认行情目录取不到时显示「—」没关系，
+    但**必须真的去取**。
+    """
+    from datetime import datetime, timezone
+    import signals.report as report_mod
+    from signals.report import generate_daily_report
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_stage2_cache(cache, "CYPH")
+
+    records = [{
+        "日期": "2026-11-05", "股票": "CYPH", "信号": "买入", "信号类型": "crossback_buy",
+        "强度星级": "★★★☆☆", "强度(1-5)": 3, "参考止损": "$48.00",
+        "触发原因": "[EMA10回踩] 上穿EMA10($49.00, +1.5%) + 量能2.5x均量",
+    }]
+
+    original_out = report_mod.OUTPUT_DIR
+    original_cache = report_mod.DEFAULT_CACHE_DIR
+    report_mod.OUTPUT_DIR = tmp_path
+    report_mod.DEFAULT_CACHE_DIR = cache
+    try:
+        path = generate_daily_report(
+            today_records=[], strategy_id="v_eps_v2", strategy_name="Weinstein + EPS",
+            crossback_records=records, watchlist_status={},
+            today=datetime(2026, 11, 6, tzinfo=timezone.utc),
+        )
+    finally:
+        report_mod.OUTPUT_DIR = original_out
+        report_mod.DEFAULT_CACHE_DIR = original_cache
+
+    content = path.read_text(encoding="utf-8")
+    section = content.split("## 第二层：EMA 10 Crossback 信号")[1]
+    header, rows = _md_table(section)
+    row = [r for r in rows if r.get("股票") == "CYPH"]
+    assert row, f"回踩区段里没有 CYPH：{header}"
+    assert row[0].get("阶段", "").startswith("Stage 2"), \
+        f"阶段没算出来（cache_dir=None 时应回落到默认行情目录）：{row[0]}"
