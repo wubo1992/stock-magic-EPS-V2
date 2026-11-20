@@ -177,6 +177,37 @@ def _close_on_date(df: pd.DataFrame | None, date_str: str) -> float | None:
     return None
 
 
+def _entry_bar(df: pd.DataFrame | None, label_date: str) -> tuple[str, float] | None:
+    """入场日那根 bar：**信号日期当天或之后**的第一根 bar。
+
+    口径（跟策略对得上）：
+      - 参考收盘 = 信号日期**之前**最后一根 bar 的收盘
+        （策略里 `df["close"].iloc[-1]`，df 已按信号日期切片过）
+      - 参考止损 = 参考收盘 × (1 − 8%)
+      - 信号日期 = 执行日（那天开盘买入）
+
+    所以「入场当日」= 信号日期当天那根 bar；信号日期不是交易日（如周末）
+    就顺延到下一个有 bar 的交易日。行情还没到信号日期 → 返回 None
+    （今天的信号还没有入场日，判不了）。
+
+    注意：这里**不**去反推参考收盘 —— 止损是记录里给的定值，
+    反推会在低价股上因四舍五入产生歧义（$2.70 → $2.48 → 2.6957）。
+    """
+    if df is None or not label_date:
+        return None
+    d = dedup_daily_bars(df)
+    if d is None or d.empty or "close" not in d.columns:
+        return None
+    try:
+        target = date.fromisoformat(str(label_date)[:10])
+    except ValueError:
+        return None
+    for ts, close in zip(d.index, d["close"]):
+        if pd.Timestamp(ts).date() >= target:
+            return str(pd.Timestamp(ts).date()), float(close)
+    return None
+
+
 def _compute_metrics(df: pd.DataFrame, symbol: str) -> Metrics | None:
     """把日线 df 折成一组指标。窗口一律按**交易日**（先 dedup）。"""
     d = dedup_daily_bars(df)
@@ -423,6 +454,8 @@ class SignalView:
     cb_ema10: float | None = None   # 回踩当天被上穿的 EMA10（从触发原因解析）
     cb_close_est: bool = False      # cb_close 是反推值（缓存里没有那根 bar）
     days_since: int | None = None   # 距今多少个交易日（相对数据日）
+    entry_date: str | None = None   # 入场日（信号日期当天或之后的第一根 bar）
+    entry_close: float | None = None  # 入场日收盘价
 
 
 @dataclass
@@ -561,6 +594,13 @@ def _build_signal_views(
                 if ema10 is not None and pct is not None:
                     cb_close = ema10 * (1.0 + pct / 100.0)
                     cb_close_est = True
+        # 入场日那根 bar：只对主策略算 —— 主策略的止损口径统一（参考收盘 × 0.92），
+        # 回踩信号的止损来自监控池的原始建仓价，混在一起统计会说不清。
+        entry_date = entry_close = None
+        if rec.get("信号类型") == MAIN_TYPE:
+            entry = _entry_bar(df, rec.get("日期", ""))
+            if entry is not None:
+                entry_date, entry_close = entry
         views.append(
             SignalView(
                 date=rec.get("日期", ""),
@@ -583,6 +623,8 @@ def _build_signal_views(
                 cb_close=cb_close,
                 cb_close_est=bool(cb_close_est),
                 cb_ema10=parsed.get("cb_ema10"),
+                entry_date=entry_date,
+                entry_close=entry_close,
             )
         )
     return views
@@ -1061,6 +1103,17 @@ def _rs_band(rating: float | None) -> str:
 # --------------------------------------------------------------------------
 # 渲染：状态列
 # --------------------------------------------------------------------------
+def _entry_day_stats(views: list[SignalView]) -> tuple[list[SignalView], int]:
+    """入场当日验证：返回 (入场当日就跌破止损的信号, 已可判定的信号数)。
+
+    「已可判定」= 入场日那根 bar 已经存在（今天的信号还没到入场日，判不了 ——
+    那种信号既不能算破止损，也不能算守住，报成「守住了」是假话）。
+    """
+    checked = [v for v in views if v.entry_close is not None and v.stop]
+    broken = [v for v in checked if v.entry_close < v.stop]
+    return broken, len(checked)
+
+
 def _status_cell(v: SignalView) -> str:
     m = v.metrics
     parts: list[str] = []
@@ -1531,6 +1584,20 @@ def render_markdown(data: ReportData, today: date) -> str:
     buckets = _bucket_counts(d.watch)
     w(f"- 🔄 **监控池**：{len(d.watch)} 只 —— 🟢 {buckets['green']} / 🟡 {buckets['yellow']} / "
       f"🔴 {buckets['red']}" + (f" / ⚪ {buckets['nodata']}" if buckets.get("nodata") else ""))
+    broken, checked = _entry_day_stats(d.history_main)
+    if checked:
+        detail = ""
+        if broken:
+            detail = "（" + " / ".join(
+                f"{v.symbol} 低于止损 {abs(v.entry_close / v.stop - 1.0) * 100:.1f}%"
+                for v in broken
+            ) + "）"
+        w(f"- 📉 **入场当日验证**：窗口内 {checked} 个历史主策略信号里，"
+          f"**{len(broken)} 个在入场当日收盘就跌破参考止损（−8%）**{detail}；"
+          f"其余 {checked - len(broken)} 个入场当日守在止损上方")
+    else:
+        w("- 📉 **入场当日验证**：窗口内没有可判定的历史主策略信号"
+          "（还没到入场日，K 线尚未收盘）")
     w("")
     w("---")
     w("")
@@ -1572,6 +1639,11 @@ def render_markdown(data: ReportData, today: date) -> str:
       "（括号里是上一完整周的读数）；周线没收完但阶段没变的照常显示，不标「待定」；"
       "「—」= 周线不足 60 根，判不了。"
       "⚠ = Stage 3 顶部（减仓），🔴 = Stage 4 下跌（离场）。")
+    w("> **注 5**：「入场当日验证」= **信号日期当天**（当天不是交易日就顺延到下一个交易日）"
+      "那根 K 线的收盘价 vs 参考止损。参考收盘 = 信号日期**之前**最后一根 K 线的收盘，"
+      "参考止损 = 参考收盘 × 0.92；信号日期 = 执行日（那天开盘买入）→ "
+      "**入场当日就跌穿 = 当日打脸**。当天的信号还没到入场日（K 线未收盘），"
+      "既不算破止损也不算守住。")
     w("")
 
     # ---------------- 段 1.5 ----------------

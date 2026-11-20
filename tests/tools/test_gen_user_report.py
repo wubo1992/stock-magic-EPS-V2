@@ -1131,3 +1131,88 @@ def test_blocked_candidate_ignores_records_after_the_report_date(blocked_stage_e
     assert row, f"被挡掉的候选没进表：\n{_blocked_section(md)}"
     assert "99" not in row[0], f"偷看了报告日之后的记录：{row[0]}"
     assert "88" in row[0], f"该用报告日之前那条记录的 RS：{row[0]}"
+
+
+# --------------------------------------------------------------------------
+# 入场当日验证：信号发出后**当天收盘就跌破 −8% 止损**（当日打脸）
+# --------------------------------------------------------------------------
+AFTER_SIGNAL_DATE = "2026-11-09"   # 信号日之后的报告日 → 11-06 那条变成历史行
+
+
+def _append_bar(cache_dir: Path, symbol: str, day: str, close: float,
+                volume: float = 100_000) -> None:
+    """给缓存里的票接一根新 bar（模拟信号发出之后的走势）。"""
+    path = cache_dir / f"{symbol}.pkl"
+    df = pd.read_pickle(path)
+    extra = pd.DataFrame(
+        {"open": close, "high": close, "low": close, "close": close, "volume": volume},
+        index=pd.DatetimeIndex([f"{day}T00:00:00Z"]),
+    )
+    pd.to_pickle(pd.concat([df, extra]), path)
+
+
+def _overview(md: str) -> str:
+    return md.split("## 🚨 今日概览")[1].split("\n---")[0]
+
+
+def test_entry_day_break_is_counted_and_named(env):
+    """入场当日收盘就跌破参考止损 → 概览必须点名 + 给出低于止损的幅度。
+
+    现场（2026-11-19 CIX）：参考收盘 49.26 → 止损 45.32，
+    入场当日（11-19）收盘 43.25 → 当日就打脸。
+    """
+    _append_bar(env["cache_dir"], "TEST", "2026-11-06", 15.90)   # 15.90 < 止损 16.33
+    md = build_user_report(
+        date_str=AFTER_SIGNAL_DATE, signals_csv=env["signals_csv"],
+        watchlist_path=env["watchlist"], cache_dir=env["cache_dir"],
+        universe_path=env["universe"],
+    )
+    ov = _overview(md)
+    assert "入场当日" in ov, f"概览里没有入场当日验证：\n{ov}"
+    assert "1 个在入场当日收盘就跌破参考止损" in ov, f"破止损的个数没统计：\n{ov}"
+    assert "TEST" in ov, f"破止损的票没被点名：\n{ov}"
+    # 低于止损的幅度：15.90 / 16.33 − 1 = −2.63%
+    assert "2.6%" in ov, f"低于止损的幅度没算出来：\n{ov}"
+    assert "0 个入场当日守在止损上方" in ov, f"剩下的个数不对：\n{ov}"
+
+
+def test_entry_day_hold_is_reported(env):
+    """入场当日守住了 → 必须报 0 个破止损，且明说几个守住了（不能只报 0 让人以为没信号）。"""
+    _append_bar(env["cache_dir"], "TEST", "2026-11-06", 17.90)   # 17.90 > 止损 16.33
+    md = build_user_report(
+        date_str=AFTER_SIGNAL_DATE, signals_csv=env["signals_csv"],
+        watchlist_path=env["watchlist"], cache_dir=env["cache_dir"],
+        universe_path=env["universe"],
+    )
+    ov = _overview(md)
+    assert "0 个在入场当日收盘就跌破参考止损" in ov, f"守住止损却报成破止损：\n{ov}"
+    assert "1 个入场当日守在止损上方" in ov, f"守住的个数没报出来：\n{ov}"
+
+
+def test_signal_without_entry_bar_is_not_counted_as_survived(env):
+    """还没到入场日的信号（K 线没出来）→ 既不算破止损，也不算守住。
+
+    报告日 = 信号日当天，行情只到前一天 → 入场日那根 bar 还不存在。
+    这种信号报成「守住了」是**假话**。
+    """
+    md = build_user_report(
+        date_str=env["date"], signals_csv=env["signals_csv"],
+        watchlist_path=env["watchlist"], cache_dir=env["cache_dir"],
+        universe_path=env["universe"],
+    )
+    ov = _overview(md)
+    assert "入场当日" in ov, f"概览里没有入场当日验证：\n{ov}"
+    assert "没有可判定" in ov, f"没到入场日的信号不该被统计成守住了：\n{ov}"
+    assert "跌破参考止损" not in ov, f"没到入场日不该报破止损：\n{ov}"
+    assert "守在止损上方" not in ov, f"没到入场日不该报守住了：\n{ov}"
+
+
+def test_entry_day_definition_is_documented(env):
+    """口径必须写清楚：入场日 = 信号日期当天；参考收盘 = 信号日期之前最后一根 K 线。"""
+    md = build_user_report(
+        date_str=AFTER_SIGNAL_DATE, signals_csv=env["signals_csv"],
+        watchlist_path=env["watchlist"], cache_dir=env["cache_dir"],
+        universe_path=env["universe"],
+    )
+    assert "入场当日验证" in md
+    assert "入场日" in md and "参考收盘" in md, "入场当日的口径没写进报告"
